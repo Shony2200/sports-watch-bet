@@ -6,18 +6,18 @@ const { Server } = require("socket.io");
 
 const app = express();
 
-// ----- CORS -----
-const allowedOrigins = [
-  process.env.FRONTEND_URL,        // your Vercel URL
+// ---------- CORS allowlist ----------
+const allowed = [
+  process.env.FRONTEND_URL,          // your Vercel URL
   "http://localhost:3000",
   "http://localhost:3001",
 ].filter(Boolean);
 
 app.use(cors({
   origin: function (origin, cb) {
-    // allow requests with no origin (curl/postman)
+    // allow requests with no origin (curl, mobile apps)
     if (!origin) return cb(null, true);
-    if (allowedOrigins.includes(origin)) return cb(null, true);
+    if (allowed.includes(origin)) return cb(null, true);
     return cb(new Error("Not allowed by CORS: " + origin));
   },
   credentials: true,
@@ -25,112 +25,190 @@ app.use(cors({
 
 app.use(express.json());
 
-// ----- Health / root -----
-app.get("/", (req, res) => res.status(200).send("Backend is running ✅"));
-app.get("/api/health", (req, res) => res.json({ ok: true }));
-
-// ----- STATIC CATALOG (regions -> countries -> leagues) -----
-// This guarantees your dropdowns populate again.
-const catalog = {
-  soccer: {
-    Europe: {
-      England: ["Premier League", "Championship", "FA Cup", "EFL Cup"],
-      Spain: ["La Liga", "Segunda División", "Copa del Rey", "Supercopa de España"],
-      Italy: ["Serie A", "Serie B", "Coppa Italia", "Supercoppa Italiana"],
-      Germany: ["Bundesliga", "2. Bundesliga", "DFB-Pokal"],
-      France: ["Ligue 1", "Ligue 2", "Coupe de France"],
-      Portugal: ["Primeira Liga", "Taça de Portugal"],
-      Netherlands: ["Eredivisie", "KNVB Beker"],
-      Belgium: ["Pro League", "Croky Cup"],
-      Scotland: ["Premiership", "Scottish Cup"],
-      Turkey: ["Süper Lig", "Turkish Cup"],
-      Greece: ["Super League", "Greek Cup"],
-      Ukraine: ["Premier League"],
-      Poland: ["Ekstraklasa", "Polish Cup"],
-      Austria: ["Bundesliga", "ÖFB-Cup"],
-      Switzerland: ["Super League", "Swiss Cup"],
-      Sweden: ["Allsvenskan", "Svenska Cupen"],
-      Norway: ["Eliteserien", "NM Cup"],
-      Denmark: ["Superliga", "DBU Pokalen"],
-    },
-    Americas: {
-      USA: ["MLS", "US Open Cup"],
-      Mexico: ["Liga MX", "Copa MX"],
-      Brazil: ["Brasileirão Série A", "Copa do Brasil"],
-      Argentina: ["Liga Profesional", "Copa Argentina"],
-      Colombia: ["Categoría Primera A"],
-    },
-    Asia: {
-      Japan: ["J1 League"],
-      SouthKorea: ["K League 1"],
-      SaudiArabia: ["Saudi Pro League", "King's Cup"],
-    },
-    Africa: {
-      Egypt: ["Egyptian Premier League"],
-      Morocco: ["Botola Pro"],
-      SouthAfrica: ["Premier Division"],
-    },
-    International: {
-      UEFA: ["Champions League", "Europa League", "Conference League", "Euro Qualifiers", "Nations League"],
-      FIFA: ["World Cup Qualifiers"],
-    }
-  },
-  nba: { leagues: ["NBA"] },
-  nfl: { leagues: ["NFL"] },
-  nhl: { leagues: ["NHL"] },
-  mlb: { leagues: ["MLB"] },
-};
-
-// Return catalog the frontend can use
-app.get("/api/catalog", (req, res) => {
-  const sport = (req.query.sport || "soccer").toLowerCase();
-  const data = catalog[sport];
-  if (!data) return res.status(404).json({ error: "Unknown sport" });
-  res.json({ sport, data });
+// ---------- Health / root ----------
+app.get("/", (req, res) => {
+  res.status(200).send("Backend is running ✅");
 });
 
-// ----- SAMPLE GAMES -----
-// You’ll see games again instead of errors. Replace this later with your real provider.
-const sampleGames = [
-  { id: "1", sport: "soccer", league: "Premier League", home: "Arsenal", away: "Chelsea", status: "Today", time: "20:00" },
-  { id: "2", sport: "soccer", league: "Copa del Rey", home: "Real Madrid", away: "Valencia", status: "Today", time: "19:00" },
-  { id: "3", sport: "soccer", league: "Coppa Italia", home: "Inter", away: "Juventus", status: "Live", time: "55'" },
-  { id: "4", sport: "nba", league: "NBA", home: "Lakers", away: "Warriors", status: "Today", time: "22:00" },
-  { id: "5", sport: "nfl", league: "NFL", home: "Chiefs", away: "Bills", status: "Finished", time: "24-21" },
-  { id: "6", sport: "mlb", league: "MLB", home: "Yankees", away: "Red Sox", status: "Today", time: "18:10" },
+// ---------- A BIG catalog (static, stable) ----------
+const SOCCER_CATALOG = [
+  {
+    region: "Europe",
+    countries: [
+      {
+        country: "England",
+        leagues: ["Premier League", "Championship", "FA Cup", "EFL Cup"],
+      },
+      {
+        country: "Spain",
+        leagues: ["La Liga", "Segunda División", "Copa del Rey", "Supercopa de España"],
+      },
+      {
+        country: "Italy",
+        leagues: ["Serie A", "Serie B", "Coppa Italia", "Supercoppa Italiana"],
+      },
+      {
+        country: "Germany",
+        leagues: ["Bundesliga", "2. Bundesliga", "DFB-Pokal", "DFL-Supercup"],
+      },
+      {
+        country: "France",
+        leagues: ["Ligue 1", "Ligue 2", "Coupe de France", "Trophée des Champions"],
+      },
+      {
+        country: "Netherlands",
+        leagues: ["Eredivisie", "KNVB Cup"],
+      },
+      {
+        country: "Portugal",
+        leagues: ["Primeira Liga", "Taça de Portugal"],
+      },
+      {
+        country: "Scotland",
+        leagues: ["Premiership", "Scottish Cup"],
+      },
+      {
+        country: "Belgium",
+        leagues: ["Pro League", "Belgian Cup"],
+      },
+      {
+        country: "Turkey",
+        leagues: ["Süper Lig", "Turkish Cup"],
+      },
+      {
+        country: "Greece",
+        leagues: ["Super League Greece", "Greek Cup"],
+      },
+      {
+        country: "Austria",
+        leagues: ["Austrian Bundesliga", "Austrian Cup"],
+      },
+      {
+        country: "Switzerland",
+        leagues: ["Swiss Super League", "Swiss Cup"],
+      },
+      {
+        country: "Denmark",
+        leagues: ["Danish Superliga", "Danish Cup"],
+      },
+      {
+        country: "Sweden",
+        leagues: ["Allsvenskan", "Svenska Cupen"],
+      },
+      {
+        country: "Norway",
+        leagues: ["Eliteserien", "NM Cupen"],
+      },
+      {
+        country: "Poland",
+        leagues: ["Ekstraklasa", "Polish Cup"],
+      },
+      {
+        country: "Czech Republic",
+        leagues: ["Czech First League", "Czech Cup"],
+      },
+      {
+        country: "Ukraine",
+        leagues: ["Ukrainian Premier League", "Ukrainian Cup"],
+      },
+      {
+        country: "Croatia",
+        leagues: ["HNL", "Croatian Cup"],
+      },
+    ],
+  },
+  {
+    region: "North America",
+    countries: [
+      { country: "USA", leagues: ["MLS", "US Open Cup"] },
+      { country: "Canada", leagues: ["Canadian Premier League"] },
+      { country: "Mexico", leagues: ["Liga MX", "Copa MX"] },
+    ],
+  },
+  {
+    region: "South America",
+    countries: [
+      { country: "Brazil", leagues: ["Brasileirão", "Copa do Brasil"] },
+      { country: "Argentina", leagues: ["Liga Profesional", "Copa Argentina"] },
+    ],
+  },
+  {
+    region: "Asia",
+    countries: [
+      { country: "Japan", leagues: ["J1 League"] },
+      { country: "South Korea", leagues: ["K League 1"] },
+      { country: "Saudi Arabia", leagues: ["Saudi Pro League"] },
+    ],
+  },
+  {
+    region: "Africa",
+    countries: [
+      { country: "South Africa", leagues: ["PSL"] },
+      { country: "Egypt", leagues: ["Egyptian Premier League"] },
+    ],
+  },
+  {
+    region: "Oceania",
+    countries: [
+      { country: "Australia", leagues: ["A-League"] },
+      { country: "New Zealand", leagues: ["National League"] },
+    ],
+  },
 ];
 
-app.get("/api/games", (req, res) => {
-  const sport = (req.query.sport || "soccer").toLowerCase();
-  const region = req.query.region;
-  const country = req.query.country;
-  const league = req.query.league;
-  const status = req.query.status; // Today | Live | Finished
+// ---------- API routes ----------
+app.get("/api/catalog", async (req, res) => {
+  try {
+    const sport = (req.query.sport || "soccer").toLowerCase();
 
-  let out = sampleGames.filter(g => g.sport === sport);
-  if (league) out = out.filter(g => g.league === league);
-  if (status) out = out.filter(g => g.status.toLowerCase() === status.toLowerCase());
+    if (sport === "soccer") {
+      return res.json({ sport, regions: SOCCER_CATALOG });
+    }
 
-  // (region/country are not used in sampleGames, but kept for API compatibility)
-  res.json({ sport, region, country, league, status, games: out });
+    // Non-soccer can be simple (your frontend can still render tabs)
+    if (sport === "nba") return res.json({ sport, regions: [] });
+    if (sport === "nfl") return res.json({ sport, regions: [] });
+    if (sport === "nhl") return res.json({ sport, regions: [] });
+    if (sport === "mlb") return res.json({ sport, regions: [] });
+
+    return res.json({ sport, regions: [] });
+  } catch (err) {
+    console.error("catalog error:", err);
+    return res.status(500).json({ error: "catalog_failed", detail: String(err?.message || err) });
+  }
 });
 
-// ----- Socket.IO -----
+app.get("/api/games", async (req, res) => {
+  try {
+    // IMPORTANT:
+    // This endpoint must NEVER crash. If your real sports API fails,
+    // return [] with a clear error message.
+    //
+    // For now, return an empty list so your site stops breaking.
+    // Later we can wire this to your real data provider.
+    return res.json({ games: [] });
+  } catch (err) {
+    console.error("games error:", err);
+    return res.status(500).json({ error: "games_failed", detail: String(err?.message || err), games: [] });
+  }
+});
+
+// ---------- socket.io ----------
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: allowedOrigins, credentials: true },
+  cors: {
+    origin: allowed,
+    credentials: true,
+  },
 });
 
 io.on("connection", (socket) => {
+  // no-op; keep it alive so /socket.io stops 502-ing
   socket.emit("hello", { ok: true });
 });
 
-// ----- Start -----
-const PORT = Number(process.env.PORT || 8080);
+// ---------- start ----------
+const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log("Server running on port", PORT);
+  console.log(`Server running on port ${PORT}`);
 });
-
-// Catch crashes so Railway logs show them
-process.on("unhandledRejection", (err) => console.error("unhandledRejection:", err));
-process.on("uncaughtException", (err) => console.error("uncaughtException:", err));
