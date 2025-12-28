@@ -1,207 +1,203 @@
+// frontend/src/App.js
 import React, { useEffect, useMemo, useState } from "react";
 import axios from "axios";
 
 const BACKEND =
   process.env.REACT_APP_BACKEND_URL ||
-  "http://localhost:3000";
-function api(path) {
-  if (!BACKEND) throw new Error("Missing REACT_APP_BACKEND_URL");
-  return `${BACKEND}${path}`;
+  "http://localhost:8080"; // local backend
+
+function safeKeys(obj) {
+  return obj ? Object.keys(obj) : [];
 }
 
 export default function App() {
   const [sport, setSport] = useState("soccer");
-  const [date, setDate] = useState(() => {
-    const d = new Date();
-    const mm = String(d.getMonth() + 1).padStart(2, "0");
-    const dd = String(d.getDate()).padStart(2, "0");
-    return `${d.getFullYear()}-${mm}-${dd}`;
-  });
 
   const [catalog, setCatalog] = useState(null);
   const [region, setRegion] = useState("");
   const [country, setCountry] = useState("");
-  const [leagueKey, setLeagueKey] = useState("");
+  const [league, setLeague] = useState("");
+  const [status, setStatus] = useState("Today");
 
-  const [events, setEvents] = useState([]);
-  const [err, setErr] = useState("");
+  const [games, setGames] = useState([]);
+  const [error, setError] = useState("");
 
-  // Load soccer catalog
+  // load catalog whenever sport changes
   useEffect(() => {
-    if (sport !== "soccer") return;
+    setError("");
+    setCatalog(null);
+    setRegion("");
+    setCountry("");
+    setLeague("");
 
-    (async () => {
-      try {
-        setErr("");
-        const r = await axios.get(api(`/api/catalog?sport=soccer`), { withCredentials: true });
-        setCatalog(r.data);
-
-        // default region
-        const firstRegion = r.data?.regions?.[0] || "";
-        setRegion(firstRegion);
-      } catch (e) {
-        setErr(`Backend/API error: ${e?.message || "Network Error"}`);
-      }
-    })();
+    axios
+      .get(`${BACKEND}/api/catalog`, { params: { sport } })
+      .then((res) => setCatalog(res.data.data))
+      .catch((e) => {
+        setError(`Backend/API error: ${e?.message || "Unknown error"}`);
+      });
   }, [sport]);
 
-  // When region changes, pick first country
-  useEffect(() => {
-    if (!catalog || !region) return;
-    const countries = catalog.countriesByRegion?.[region] || [];
-    const firstCountry = countries[0] || "";
-    setCountry(firstCountry);
-  }, [catalog, region]);
+  const regionOptions = useMemo(() => {
+    if (sport !== "soccer") return [];
+    return ["", ...safeKeys(catalog)];
+  }, [catalog, sport]);
 
-  // When country changes, pick first league
-  useEffect(() => {
-    if (!catalog || !country) return;
-    const leagues = catalog.leaguesByCountry?.[country] || [];
-    setLeagueKey(leagues[0]?.key || "");
-  }, [catalog, country]);
+  const countryOptions = useMemo(() => {
+    if (sport !== "soccer") return [];
+    if (!region || !catalog?.[region]) return [""];
+    return ["", ...safeKeys(catalog[region])];
+  }, [catalog, region, sport]);
 
-  const leaguesForCountry = useMemo(() => {
-    if (!catalog || !country) return [];
-    return catalog.leaguesByCountry?.[country] || [];
-  }, [catalog, country]);
-
-  async function loadGames() {
-    try {
-      setErr("");
-      setEvents([]);
-
-      let url = "";
-      if (sport === "soccer") {
-        url = api(`/api/games?sport=soccer&date=${date}&leagueKey=${encodeURIComponent(leagueKey)}`);
-      } else {
-        url = api(`/api/games?sport=${sport}&date=${date}`);
-      }
-
-      const r = await axios.get(url, { withCredentials: true });
-      setEvents(r.data?.events || []);
-    } catch (e) {
-      setErr(`Backend/API error: ${e?.message || "Network Error"}`);
+  const leagueOptions = useMemo(() => {
+    if (sport !== "soccer") {
+      const leagues = catalog?.leagues || [];
+      return ["", ...leagues];
     }
-  }
+    if (!region || !country) return [""];
+    return ["", ...(catalog?.[region]?.[country] || [])];
+  }, [catalog, region, country, sport]);
 
+  // load games
   useEffect(() => {
-    // auto-load whenever key options change
-    if (!BACKEND) {
-      setErr("Backend/API error: Missing REACT_APP_BACKEND_URL on Vercel/local env");
-      return;
+    setError("");
+
+    const params = {
+      sport,
+      status,
+    };
+    if (sport === "soccer") {
+      if (region) params.region = region;
+      if (country) params.country = country;
+      if (league) params.league = league;
+    } else {
+      if (league) params.league = league;
     }
-    loadGames();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sport, date, leagueKey]);
+
+    axios
+      .get(`${BACKEND}/api/games`, { params })
+      .then((res) => setGames(res.data.games || []))
+      .catch((e) => {
+        setGames([]);
+        setError(`Backend/API error: ${e?.message || "Unknown error"}`);
+      });
+  }, [sport, region, country, league, status]);
 
   return (
-    <div style={{ padding: 20, fontFamily: "Arial, sans-serif" }}>
-      <h2>Lobby</h2>
+    <div style={{ padding: 24, fontFamily: "Arial, sans-serif" }}>
+      <h1>Lobby</h1>
 
-      <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-        {["soccer", "nba", "nfl", "nhl", "mlb"].map(s => (
+      <div style={{ display: "flex", gap: 10, marginBottom: 20, flexWrap: "wrap" }}>
+        {["soccer", "nba", "nfl", "nhl", "mlb"].map((s) => (
           <button
             key={s}
             onClick={() => setSport(s)}
             style={{
-              padding: "8px 14px",
-              border: "1px solid #333",
-              background: sport === s ? "#eee" : "white",
-              cursor: "pointer"
+              padding: "10px 18px",
+              border: "1px solid #888",
+              background: sport === s ? "#ddd" : "#fff",
+              cursor: "pointer",
             }}
           >
             {s.toUpperCase()}
           </button>
         ))}
-
-        <input
-          type="date"
-          value={date}
-          onChange={(e) => setDate(e.target.value)}
-          style={{ padding: "8px 10px" }}
-        />
-
-        <button onClick={loadGames} style={{ padding: "8px 14px" }}>
-          Refresh
-        </button>
       </div>
 
-      {sport === "soccer" && (
-        <div style={{ marginTop: 20, border: "1px solid #ccc", padding: 14 }}>
-          <h3>Soccer filters</h3>
+      <h2>Filters</h2>
 
-          <div style={{ display: "flex", gap: 16, flexWrap: "wrap" }}>
-            <div>
-              <div>Region</div>
-              <select
-                value={region}
-                onChange={(e) => setRegion(e.target.value)}
-                style={{ padding: 8, minWidth: 220 }}
-              >
-                {(catalog?.regions || []).map(r => (
-                  <option key={r} value={r}>{r}</option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <div>Country</div>
-              <select
-                value={country}
-                onChange={(e) => setCountry(e.target.value)}
-                style={{ padding: 8, minWidth: 220 }}
-              >
-                {(catalog?.countriesByRegion?.[region] || []).map(c => (
-                  <option key={c} value={c}>{c}</option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <div>League</div>
-              <select
-                value={leagueKey}
-                onChange={(e) => setLeagueKey(e.target.value)}
-                style={{ padding: 8, minWidth: 260 }}
-              >
-                {leaguesForCountry.map(l => (
-                  <option key={l.key} value={l.key}>{l.name}</option>
-                ))}
-              </select>
-            </div>
+      {sport === "soccer" ? (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, maxWidth: 700 }}>
+          <div>
+            <div>Region</div>
+            <select value={region} onChange={(e) => { setRegion(e.target.value); setCountry(""); setLeague(""); }}>
+              {regionOptions.map((r) => (
+                <option key={r || "all"} value={r}>
+                  {r || "(All / Popular mix)"}
+                </option>
+              ))}
+            </select>
           </div>
 
-          <div style={{ marginTop: 10, fontSize: 12, color: "#555" }}>
-            Tip: If ESPN doesn’t have games for that date/league, it will show “No games found” (not an error).
+          <div>
+            <div>Country</div>
+            <select value={country} onChange={(e) => { setCountry(e.target.value); setLeague(""); }} disabled={!region}>
+              {countryOptions.map((c) => (
+                <option key={c || "none"} value={c}>
+                  {c || "(Pick a region first)"}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <div>League</div>
+            <select value={league} onChange={(e) => setLeague(e.target.value)} disabled={!country}>
+              {leagueOptions.map((l) => (
+                <option key={l || "none"} value={l}>
+                  {l || "(Pick a country first)"}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <div>Status</div>
+            <select value={status} onChange={(e) => setStatus(e.target.value)}>
+              {["Today", "Live", "Finished"].map((x) => (
+                <option key={x} value={x}>{x}</option>
+              ))}
+            </select>
+          </div>
+        </div>
+      ) : (
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, maxWidth: 700 }}>
+          <div>
+            <div>League</div>
+            <select value={league} onChange={(e) => setLeague(e.target.value)}>
+              {leagueOptions.map((l) => (
+                <option key={l || "all"} value={l}>
+                  {l || "(All)"}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          <div>
+            <div>Status</div>
+            <select value={status} onChange={(e) => setStatus(e.target.value)}>
+              {["Today", "Live", "Finished"].map((x) => (
+                <option key={x} value={x}>{x}</option>
+              ))}
+            </select>
           </div>
         </div>
       )}
 
-      <h3 style={{ marginTop: 20 }}>Games</h3>
+      <h2 style={{ marginTop: 24 }}>Games</h2>
 
-      {err && (
-        <div style={{ border: "1px solid red", padding: 10, color: "darkred" }}>
-          {err}
+      {error ? (
+        <div style={{ border: "1px solid red", padding: 12, color: "red", maxWidth: 900 }}>
+          {error}
           <div style={{ marginTop: 6, fontSize: 12 }}>
-            If deployed: check <b>REACT_APP_BACKEND_URL</b> on Vercel and your Railway backend health.
+            If deployed: check <b>REACT_APP_BACKEND_URL</b> on Vercel + <b>FRONTEND_URL</b> on Railway.
           </div>
         </div>
-      )}
+      ) : null}
 
-      {!err && events.length === 0 && (
-        <div style={{ padding: 10, color: "#555" }}>
-          No games found for this selection.
-        </div>
-      )}
-
-      {events.map(ev => (
-        <div key={ev.id} style={{ padding: 10, borderBottom: "1px solid #ddd" }}>
-          <div style={{ fontWeight: "bold" }}>{ev.name}</div>
-          <div style={{ fontSize: 12, color: "#666" }}>
-            {ev.shortStatus || ev.status} • {new Date(ev.date).toLocaleString()}
-          </div>
-        </div>
-      ))}
+      <div style={{ marginTop: 12 }}>
+        {games.length === 0 ? (
+          <div>No games found for this selection.</div>
+        ) : (
+          <ul>
+            {games.map((g) => (
+              <li key={g.id}>
+                <b>{g.league}</b> — {g.home} vs {g.away} — {g.status} — {g.time}
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
     </div>
   );
 }
