@@ -129,7 +129,6 @@ io.on("connection", (socket) => {
 const PORT = Number(process.env.PORT || 8080);
 server.listen(PORT, "0.0.0.0", () => {
   console.log("Server running on port", PORT);
-  console.log("Allowed origins:", allowedOrigins);
 });
 
 // Catch crashes so Railway logs show them
