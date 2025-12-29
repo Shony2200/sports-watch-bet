@@ -5,50 +5,43 @@ const http = require("http");
 const cors = require("cors");
 const axios = require("axios");
 const { Server } = require("socket.io");
+const twilio = require("twilio");
 
 const app = express();
-app.use(express.json());
 
-/**
- * IMPORTANT:
- * - For deployments (Railway), you MUST bind to 0.0.0.0 and use process.env.PORT
- * - CORS: allow your Vercel URL + local dev
- */
+// --------- CORS (VERY IMPORTANT for Vercel + Railway) ----------
 const allowedOrigins = [
-  process.env.FRONTEND_URL,          // e.g. https://your-app.vercel.app
+  process.env.FRONTEND_URL, // your vercel url
+  "http://localhost:3000",
   "http://localhost:3001",
-  "http://127.0.0.1:3001",
 ].filter(Boolean);
 
 app.use(
   cors({
     origin: function (origin, cb) {
-      if (!origin) return cb(null, true); // curl/postman
+      // allow no-origin (curl/postman) + allowed list
+      if (!origin) return cb(null, true);
       if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error("CORS blocked: " + origin));
+      return cb(new Error("Not allowed by CORS: " + origin));
     },
     credentials: true,
   })
 );
 
+app.use(express.json());
+
 const server = http.createServer(app);
+
 const io = new Server(server, {
-  cors: { origin: allowedOrigins, credentials: true },
+  cors: {
+    origin: allowedOrigins,
+    credentials: true,
+  },
 });
 
-/**
- * ESPN Site API (NO KEY)
- * Soccer scoreboard requires league in PATH:
- *   https://site.api.espn.com/apis/site/v2/sports/soccer/{LEAGUE}/scoreboard?dates=YYYYMMDD
- * NBA:
- *   https://site.api.espn.com/apis/site/v2/sports/basketball/nba/scoreboard?dates=YYYYMMDD
- * Summary:
- *   https://site.api.espn.com/apis/site/v2/sports/{SPORTPATH}/summary?event={EVENT_ID}
- */
-
+// ---------------- ESPN helpers ----------------
 function yyyymmddFromISO(isoDate) {
-  if (!isoDate) return null;
-  const [y, m, d] = String(isoDate).split("-");
+  const [y, m, d] = String(isoDate || "").split("-");
   if (!y || !m || !d) return null;
   return `${y}${m}${d}`;
 }
@@ -58,20 +51,15 @@ function safeNum(x) {
   return Number.isFinite(n) ? n : null;
 }
 
-function normStatus(detail, shortDetail) {
-  const d = String(detail || "").toUpperCase();
-  const s = String(shortDetail || "").toUpperCase();
-
-  // soccer
-  if (d.includes("HALF") || s === "HT") return "HT";
-  if (d.includes("FULL") || s === "FT" || d.includes("FINAL")) return "FT";
-
+function normStatus(detail) {
+  const s = String(detail || "").toUpperCase();
+  // Soccer
+  if (s.includes("FULL TIME") || s === "FT" || s.includes("FINAL")) return "FT";
+  if (s.includes("HALF") || s === "HT") return "HT";
   // US sports
-  if (d.includes("FINAL") || s === "FINAL") return "FINAL";
-  if (d.includes("HALFTIME") || s === "HALF") return "HALFTIME";
-  if (d.includes("IN PROGRESS") || d.includes("LIVE")) return "LIVE";
-
-  return shortDetail || detail || "";
+  if (s.includes("IN PROGRESS") || s.includes("LIVE")) return "LIVE";
+  if (s.includes("HALFTIME")) return "HALFTIME";
+  return detail || "";
 }
 
 function pickSoccerPenInfo(comp) {
@@ -88,7 +76,7 @@ function pickSoccerPenInfo(comp) {
   }
 }
 
-function mapEspnEventToGame({ event, sportKey, leagueLabel, leagueCode, country }) {
+function mapEspnEventToGame({ event, sportKey, leagueLabel, country, leagueCode }) {
   const comp = event?.competitions?.[0];
   const competitors = comp?.competitors || [];
   const homeC = competitors.find((c) => c.homeAway === "home");
@@ -97,14 +85,14 @@ function mapEspnEventToGame({ event, sportKey, leagueLabel, leagueCode, country 
   const home = homeC?.team?.displayName || homeC?.team?.name || "Home";
   const away = awayC?.team?.displayName || awayC?.team?.name || "Away";
 
-  const homeScore = safeNum(homeC?.score);
-  const awayScore = safeNum(awayC?.score);
-
   const startTime = comp?.date || event?.date || "";
 
-  const detail = comp?.status?.type?.detail || comp?.status?.type?.name || "";
-  const shortDetail = comp?.status?.type?.shortDetail || comp?.status?.type?.abbreviation || "";
-  const status = normStatus(detail, shortDetail);
+  const statusDetail = comp?.status?.type?.detail || comp?.status?.type?.name || "";
+  const status = normStatus(statusDetail);
+
+  // Scores: ESPN often returns "0" even pregame for some sports; we handle on frontend too
+  const homeScore = safeNum(homeC?.score);
+  const awayScore = safeNum(awayC?.score);
 
   const pens = sportKey === "soccer" ? pickSoccerPenInfo(comp) : null;
 
@@ -124,89 +112,77 @@ function mapEspnEventToGame({ event, sportKey, leagueLabel, leagueCode, country 
   };
 }
 
-/**
- * Soccer catalog.
- * NOTE: ESPN doesn't have *every* league in the world in this API.
- * Add more by appending items here.
- */
+// ------------ Soccer catalog (expandable) -------------
 const SOCCER_CATALOG = [
-  // CONTINENT / INTERNATIONAL
+  // Continents / International
   { region: "Europe", country: "Europe", league: "UEFA Champions League", leagueCode: "uefa.champions" },
   { region: "Europe", country: "Europe", league: "UEFA Europa League", leagueCode: "uefa.europa" },
-  { region: "Europe", country: "Europe", league: "UEFA Conference League", leagueCode: "uefa.europa.conf" },
+  { region: "Europe", country: "Europe", league: "UEFA Conference League", leagueCode: "uefa.conf" },
 
-  { region: "Asia", country: "Asia", league: "AFC Champions League", leagueCode: "afc.champions" },
-
+  { region: "Asia", country: "Asia", league: "AFC Champions League Elite", leagueCode: "afc.champions" },
   { region: "Africa", country: "Africa", league: "CAF Champions League", leagueCode: "caf.champions" },
 
   { region: "North America", country: "North America", league: "CONCACAF Champions Cup", leagueCode: "concacaf.champions" },
+  { region: "South America", country: "South America", league: "CONMEBOL Libertadores", leagueCode: "conmebol.libertadores" },
 
-  // ENGLAND
+  // England
   { region: "Europe", country: "England", league: "Premier League", leagueCode: "eng.1" },
   { region: "Europe", country: "England", league: "Championship", leagueCode: "eng.2" },
   { region: "Europe", country: "England", league: "League One", leagueCode: "eng.3" },
   { region: "Europe", country: "England", league: "FA Cup", leagueCode: "eng.fa" },
-  { region: "Europe", country: "England", league: "EFL Cup", leagueCode: "eng.league_cup" },
+  { region: "Europe", country: "England", league: "EFL Cup", leagueCode: "eng.lcup" },
 
-  // SPAIN
+  // Spain
   { region: "Europe", country: "Spain", league: "LaLiga", leagueCode: "esp.1" },
   { region: "Europe", country: "Spain", league: "LaLiga 2", leagueCode: "esp.2" },
   { region: "Europe", country: "Spain", league: "Copa del Rey", leagueCode: "esp.copa_del_rey" },
 
-  // ITALY
+  // Italy
   { region: "Europe", country: "Italy", league: "Serie A", leagueCode: "ita.1" },
   { region: "Europe", country: "Italy", league: "Serie B", leagueCode: "ita.2" },
   { region: "Europe", country: "Italy", league: "Coppa Italia", leagueCode: "ita.coppa_italia" },
 
-  // GERMANY
+  // Germany
   { region: "Europe", country: "Germany", league: "Bundesliga", leagueCode: "ger.1" },
   { region: "Europe", country: "Germany", league: "2. Bundesliga", leagueCode: "ger.2" },
   { region: "Europe", country: "Germany", league: "DFB Pokal", leagueCode: "ger.dfb_pokal" },
 
-  // FRANCE
+  // France
   { region: "Europe", country: "France", league: "Ligue 1", leagueCode: "fra.1" },
   { region: "Europe", country: "France", league: "Ligue 2", leagueCode: "fra.2" },
   { region: "Europe", country: "France", league: "Coupe de France", leagueCode: "fra.coupe_de_france" },
 
-  // PORTUGAL / NETHERLANDS
+  // Portugal, Netherlands
   { region: "Europe", country: "Portugal", league: "Primeira Liga", leagueCode: "por.1" },
   { region: "Europe", country: "Netherlands", league: "Eredivisie", leagueCode: "ned.1" },
 
-  // SCANDINAVIA (examples)
-  { region: "Europe", country: "Denmark", league: "Danish Superliga", leagueCode: "den.1" },
-  { region: "Europe", country: "Sweden", league: "Allsvenskan", leagueCode: "swe.1" },
-  { region: "Europe", country: "Norway", league: "Eliteserien", leagueCode: "nor.1" },
-
-  // USA / MEXICO (Messi MLS etc.)
-  { region: "North America", country: "United States", league: "MLS", leagueCode: "usa.1" },
-  { region: "North America", country: "Mexico", league: "Liga MX", leagueCode: "mex.1" },
-
-  // SAUDI (Ronaldo)
+  // Saudi + MLS (Ronaldo/Messi leagues)
   { region: "Asia", country: "Saudi Arabia", league: "Saudi Pro League", leagueCode: "ksa.1" },
+  { region: "North America", country: "United States", league: "MLS", leagueCode: "usa.1" },
 
-  // BRAZIL / ARGENTINA
+  // Brazil, Argentina
   { region: "South America", country: "Brazil", league: "Brazil Serie A", leagueCode: "bra.1" },
-  { region: "South America", country: "Argentina", league: "Argentina Primera", leagueCode: "arg.1" },
+  { region: "South America", country: "Argentina", league: "Argentina Liga Profesional", leagueCode: "arg.1" },
 ];
 
 function buildSoccerCatalogTree() {
-  const regions = new Map();
+  const regions = new Map(); // region -> Map(country -> leagues[])
   for (const item of SOCCER_CATALOG) {
     if (!regions.has(item.region)) regions.set(item.region, new Map());
-    const cMap = regions.get(item.region);
-    if (!cMap.has(item.country)) cMap.set(item.country, []);
-    cMap.get(item.country).push({ league: item.league, leagueCode: item.leagueCode });
+    const countries = regions.get(item.region);
+    if (!countries.has(item.country)) countries.set(item.country, []);
+    countries.get(item.country).push({ league: item.league, leagueCode: item.leagueCode });
   }
 
   const out = [];
-  for (const [region, cMap] of regions.entries()) {
-    const countries = [];
-    for (const [country, leagues] of cMap.entries()) {
+  for (const [region, countriesMap] of regions.entries()) {
+    const countriesArr = [];
+    for (const [country, leagues] of countriesMap.entries()) {
       leagues.sort((a, b) => a.league.localeCompare(b.league));
-      countries.push({ country, leagues });
+      countriesArr.push({ country, leagues });
     }
-    countries.sort((a, b) => a.country.localeCompare(b.country));
-    out.push({ region, countries });
+    countriesArr.sort((a, b) => a.country.localeCompare(b.country));
+    out.push({ region, countries: countriesArr });
   }
 
   const priority = ["Europe", "Asia", "Africa", "North America", "South America", "Oceania"];
@@ -219,34 +195,59 @@ function buildSoccerCatalogTree() {
   return out;
 }
 
-async function fetchScoreboardByPath({ sportKey, espnPath, leagueCodeInPath, isoDate, leagueLabel, country }) {
+// --------- ESPN fetch ---------
+async function fetchEspnScoreboard({ sportKey, espnSportPath, leagueCode, leagueLabel, country, isoDate }) {
   const dates = yyyymmddFromISO(isoDate);
-  if (!dates) throw new Error("Bad date (use YYYY-MM-DD)");
+  if (!dates) {
+    const e = new Error("Bad date");
+    e.status = 400;
+    throw e;
+  }
 
-  // Soccer requires league in path
-  const url =
-    sportKey === "soccer"
-      ? `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(
-          leagueCodeInPath
-        )}/scoreboard?dates=${dates}`
-      : `https://site.api.espn.com/apis/site/v2/sports/${espnPath}/scoreboard?dates=${dates}`;
+  // Soccer: use /soccer/{leagueCode}/scoreboard
+  // Other sports: /{sportPath}/scoreboard
+  let url = "";
 
-  const { data } = await axios.get(url, { timeout: 15000 });
+  if (sportKey === "soccer") {
+    // This is the correct ESPN soccer endpoint format:
+    // https://site.api.espn.com/apis/v2/sports/soccer/{LEAGUE}/scoreboard?dates=YYYYMMDD
+    if (!leagueCode) {
+      const e = new Error("Missing leagueCode for soccer");
+      e.status = 400;
+      throw e;
+    }
+    url = `https://site.api.espn.com/apis/v2/sports/soccer/${encodeURIComponent(leagueCode)}/scoreboard?dates=${dates}`;
+  } else {
+    url = `https://site.api.espn.com/apis/v2/sports/${espnSportPath}/scoreboard?dates=${dates}`;
+  }
+
+  let data;
+  try {
+    const resp = await axios.get(url, { timeout: 15000 });
+    data = resp.data;
+  } catch (err) {
+    const status = err?.response?.status;
+    const msg = status ? `ESPN returned status ${status}` : (err?.message || "ESPN request failed");
+    const e = new Error(msg);
+    e.status = status || 500;
+    throw e;
+  }
+
   const events = data?.events || [];
-
   return events.map((event) =>
     mapEspnEventToGame({
       event,
       sportKey,
       leagueLabel,
-      leagueCode: leagueCodeInPath || "",
       country,
+      leagueCode,
     })
   );
 }
 
-// ---------- Routes ----------
+// ----------------- Routes -----------------
 app.get("/", (req, res) => res.send("Backend is running 🚀"));
+
 app.get("/api/health", (req, res) => res.json({ ok: true }));
 
 app.get("/api/catalog", (req, res) => {
@@ -255,15 +256,38 @@ app.get("/api/catalog", (req, res) => {
   return res.json({ regions: buildSoccerCatalogTree() });
 });
 
+// Twilio ICE servers for WebRTC (TURN)
+app.get("/api/ice", async (req, res) => {
+  try {
+    const sid = process.env.TWILIO_ACCOUNT_SID;
+    const token = process.env.TWILIO_AUTH_TOKEN;
+    if (!sid || !token) {
+      return res.json({
+        iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+        note: "Twilio not configured, using public STUN only",
+      });
+    }
+
+    const client = twilio(sid, token);
+    const tw = await client.tokens.create();
+    return res.json({ iceServers: tw.iceServers || [] });
+  } catch (e) {
+    return res.json({
+      iceServers: [{ urls: ["stun:stun.l.google.com:19302"] }],
+      note: "Twilio failed, fallback STUN",
+      error: e?.message || String(e),
+    });
+  }
+});
+
 app.get("/api/games", async (req, res) => {
   try {
     const sport = String(req.query.sport || "soccer");
     const date = String(req.query.date || "");
-    const leagueCode = String(req.query.leagueCode || ""); // soccer only
+    const leagueCode = String(req.query.leagueCode || "");
 
+    // Soccer: if no league selected, use a “popular mix”
     if (sport === "soccer") {
-      // If leagueCode chosen -> fetch only that league
-      // else -> fetch a "popular mix" (you can expand this list)
       const codes = leagueCode
         ? [leagueCode]
         : [
@@ -282,24 +306,24 @@ app.get("/api/games", async (req, res) => {
       const all = [];
       for (const code of codes) {
         const cat = SOCCER_CATALOG.find((x) => x.leagueCode === code);
-        const label = cat?.league || code;
+        const lLabel = cat?.league || code;
         const ctry = cat?.country || "";
-
         try {
-          const games = await fetchScoreboardByPath({
+          const games = await fetchEspnScoreboard({
             sportKey: "soccer",
-            espnPath: "", // unused for soccer
-            leagueCodeInPath: code,
-            isoDate: date,
-            leagueLabel: label,
+            espnSportPath: "soccer",
+            leagueCode: code,
+            leagueLabel: lLabel,
             country: ctry,
+            isoDate: date,
           });
           all.push(...games);
         } catch (e) {
-          console.log("ESPN soccer league failed:", code, e?.response?.status || e?.message);
+          console.log("ESPN soccer league failed:", code, e?.status || e?.message);
         }
       }
 
+      // dedupe
       const seen = new Set();
       const deduped = [];
       for (const g of all) {
@@ -308,39 +332,34 @@ app.get("/api/games", async (req, res) => {
         deduped.push(g);
       }
 
-      deduped.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+      deduped.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
       return res.json({ games: deduped });
     }
 
-    const MAP = {
-      nba: { espnPath: "basketball/nba", label: "NBA", country: "United States" },
-      nfl: { espnPath: "football/nfl", label: "NFL", country: "United States" },
-      nhl: { espnPath: "hockey/nhl", label: "NHL", country: "United States/Canada" },
-      mlb: { espnPath: "baseball/mlb", label: "MLB", country: "United States" },
+    // NBA/NFL/NHL/MLB
+    const map = {
+      nba: { sportPath: "basketball/nba", label: "NBA", country: "United States" },
+      nfl: { sportPath: "football/nfl", label: "NFL", country: "United States" },
+      nhl: { sportPath: "hockey/nhl", label: "NHL", country: "United States/Canada" },
+      mlb: { sportPath: "baseball/mlb", label: "MLB", country: "United States" },
     };
 
-    if (!MAP[sport]) return res.json({ games: [] });
+    if (map[sport]) {
+      const meta = map[sport];
+      const games = await fetchEspnScoreboard({
+        sportKey: sport,
+        espnSportPath: meta.sportPath,
+        leagueCode: "",
+        leagueLabel: meta.label,
+        country: meta.country,
+        isoDate: date,
+      });
 
-    const meta = MAP[sport];
-    const games = await fetchScoreboardByPath({
-      sportKey: sport,
-      espnPath: meta.espnPath,
-      leagueCodeInPath: "",
-      isoDate: date,
-      leagueLabel: meta.label,
-      country: meta.country,
-    });
+      games.sort((a, b) => new Date(a.startTime).getTime() - new Date(b.startTime).getTime());
+      return res.json({ games });
+    }
 
-    // Hide 0-0 for pregame
-    const cleaned = games.map((g) => {
-      const st = String(g.status || "").toUpperCase();
-      const pre = st.includes("SCHEDULED") || st.includes("PRE") || st.includes("AM") || st.includes("PM");
-      if (pre) return { ...g, homeScore: null, awayScore: null };
-      return g;
-    });
-
-    cleaned.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    return res.json({ games: cleaned });
+    return res.json({ games: [] });
   } catch (err) {
     return res.status(500).json({
       error: "Games request failed",
@@ -349,48 +368,9 @@ app.get("/api/games", async (req, res) => {
   }
 });
 
-// Details / stats / boxscore-ish
-app.get("/api/summary", async (req, res) => {
-  try {
-    const sport = String(req.query.sport || "");
-    const eventId = String(req.query.eventId || "");
-    const soccerLeague = String(req.query.leagueCode || ""); // required for soccer
-
-    if (!eventId) return res.status(400).json({ error: "Missing eventId" });
-
-    let url = "";
-
-    if (sport === "soccer") {
-      if (!soccerLeague) return res.status(400).json({ error: "Missing leagueCode for soccer summary" });
-      url = `https://site.api.espn.com/apis/site/v2/sports/soccer/${encodeURIComponent(
-        soccerLeague
-      )}/summary?event=${encodeURIComponent(eventId)}`;
-    } else {
-      const map = {
-        nba: "basketball/nba",
-        nfl: "football/nfl",
-        nhl: "hockey/nhl",
-        mlb: "baseball/mlb",
-      };
-      if (!map[sport]) return res.status(400).json({ error: "Unsupported sport" });
-      url = `https://site.api.espn.com/apis/site/v2/sports/${map[sport]}/summary?event=${encodeURIComponent(eventId)}`;
-    }
-
-    const { data } = await axios.get(url, { timeout: 15000 });
-
-    // Send back the raw ESPN summary (frontend will render what exists)
-    return res.json({ ok: true, data });
-  } catch (err) {
-    return res.status(500).json({
-      error: "Summary request failed",
-      details: err?.response?.status ? `ESPN returned status ${err.response.status}` : err?.message || String(err),
-    });
-  }
-});
-
-// ---------- Rooms / chat / betting / private video signaling ----------
+// ---------------- Rooms / chat / bets / video signaling ----------------
 const roomState = new Map();
-// roomId -> { users:[{id,username,credits}], bets:[], match, videoAllowed:boolean }
+// roomId -> { users:[], bets:[], match, videoReady:Set(socketId) }
 
 function getOrCreateRoom(roomId) {
   if (!roomState.has(roomId)) {
@@ -398,7 +378,7 @@ function getOrCreateRoom(roomId) {
       users: [],
       bets: [],
       match: null,
-      videoAllowed: String(roomId).startsWith("private:"),
+      videoReady: new Set(),
     });
   }
   return roomState.get(roomId);
@@ -411,28 +391,42 @@ function emitRoom(roomId) {
     users: st.users,
     bets: st.bets,
     match: st.match,
-    videoAllowed: st.videoAllowed,
   });
+}
+
+// deterministic initiator so you don't get double-initiator fights
+function isInitiator(a, b) {
+  return String(a) < String(b);
 }
 
 io.on("connection", (socket) => {
   socket.on("joinRoom", ({ roomId, username, match }) => {
     if (!roomId || !username) return;
-
     socket.join(roomId);
+
     const st = getOrCreateRoom(roomId);
     st.match = match || st.match;
 
+    // store user
     st.users = st.users.filter((u) => u.id !== socket.id);
-    st.users.push({ id: socket.id, username, credits: 1000 });
+    st.users.push({ id: socket.id, username: String(username), credits: 1000 });
 
     io.to(roomId).emit("message", { user: "System", text: `${username} joined` });
     emitRoom(roomId);
+  });
 
-    // signal peer join (for private video)
-    if (st.videoAllowed) {
-      socket.to(roomId).emit("peer-joined", { peerId: socket.id });
-    }
+  socket.on("leaveRoom", ({ roomId }) => {
+    if (!roomId) return;
+    socket.leave(roomId);
+    const st = roomState.get(roomId);
+    if (!st) return;
+
+    st.videoReady.delete(socket.id);
+    st.users = st.users.filter((u) => u.id !== socket.id);
+
+    io.to(roomId).emit("video-peer-left", { peerId: socket.id });
+    emitRoom(roomId);
+    if (st.users.length === 0) roomState.delete(roomId);
   });
 
   socket.on("chatMessage", ({ roomId, user, text }) => {
@@ -440,17 +434,10 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("message", { user, text });
   });
 
-  // WebRTC signaling relay
-  socket.on("signal", ({ to, from, data }) => {
-    if (!to || !data) return;
-    io.to(to).emit("signal", { from, data });
-  });
-
-  // Betting
+  // ---- Bets (MVP) ----
   socket.on("createBetOffer", ({ roomId, targetUserId, title, stake, pick }) => {
     const st = roomState.get(roomId);
     if (!st) return;
-    if (!st.videoAllowed) return; // betting only in private
 
     const me = st.users.find((u) => u.id === socket.id);
     const target = st.users.find((u) => u.id === targetUserId);
@@ -468,7 +455,7 @@ io.on("connection", (socket) => {
       creatorStake: Number(stake || 0),
       targetStake: Number(stake || 0),
       creatorPick: String(pick || ""),
-      targetPick: "",
+      winnerName: "",
     });
 
     emitRoom(roomId);
@@ -478,7 +465,6 @@ io.on("connection", (socket) => {
   socket.on("acceptBetOffer", ({ roomId, betId, targetPick, targetStake }) => {
     const st = roomState.get(roomId);
     if (!st) return;
-    if (!st.videoAllowed) return;
 
     const bet = st.bets.find((b) => b.id === betId);
     if (!bet || bet.status !== "pending") return;
@@ -495,8 +481,6 @@ io.on("connection", (socket) => {
   socket.on("cancelBetOffer", ({ roomId, betId }) => {
     const st = roomState.get(roomId);
     if (!st) return;
-    if (!st.videoAllowed) return;
-
     const bet = st.bets.find((b) => b.id === betId);
     if (!bet || bet.status !== "pending") return;
     if (socket.id !== bet.creatorId) return;
@@ -505,19 +489,58 @@ io.on("connection", (socket) => {
     emitRoom(roomId);
   });
 
+  // ---- VIDEO READY + SIGNALING ----
+  socket.on("video-ready", ({ roomId }) => {
+    const st = roomState.get(roomId);
+    if (!st) return;
+
+    st.videoReady.add(socket.id);
+
+    // pair with everyone else who is video-ready
+    for (const otherId of st.videoReady) {
+      if (otherId === socket.id) continue;
+
+      // tell BOTH ends to create a peer with deterministic initiator
+      io.to(socket.id).emit("video-peer", {
+        peerId: otherId,
+        initiator: isInitiator(socket.id, otherId),
+      });
+      io.to(otherId).emit("video-peer", {
+        peerId: socket.id,
+        initiator: isInitiator(otherId, socket.id),
+      });
+    }
+  });
+
+  socket.on("video-stop", ({ roomId }) => {
+    const st = roomState.get(roomId);
+    if (!st) return;
+    st.videoReady.delete(socket.id);
+    io.to(roomId).emit("video-peer-left", { peerId: socket.id });
+  });
+
+  socket.on("signal", ({ to, data }) => {
+    if (!to) return;
+    io.to(to).emit("signal", { from: socket.id, data });
+  });
+
   socket.on("disconnect", () => {
     for (const [roomId, st] of roomState.entries()) {
       const before = st.users.length;
+
+      st.videoReady.delete(socket.id);
       st.users = st.users.filter((u) => u.id !== socket.id);
+
       if (st.users.length !== before) {
-        socket.to(roomId).emit("peer-left", { peerId: socket.id });
         io.to(roomId).emit("message", { user: "System", text: `Someone left` });
+        io.to(roomId).emit("video-peer-left", { peerId: socket.id });
         emitRoom(roomId);
       }
+
       if (st.users.length === 0) roomState.delete(roomId);
     }
   });
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));

@@ -3,7 +3,6 @@ import axios from "axios";
 import { io } from "socket.io-client";
 import Peer from "simple-peer";
 
-// Use env in Vercel, fallback to localhost
 const BACKEND = process.env.REACT_APP_BACKEND_URL || "http://localhost:3000";
 const socket = io(BACKEND, { transports: ["websocket", "polling"] });
 
@@ -40,7 +39,16 @@ function fmtTime(iso) {
 
 function isLive(status) {
   const s = String(status || "").toUpperCase();
-  return s === "LIVE" || s.includes("IN PROGRESS") || s.includes("Q") || s.includes("PERIOD");
+  // soccer
+  if (s === "HT") return true;
+  // US sports
+  return (
+    s.includes("LIVE") ||
+    s.includes("IN PROGRESS") ||
+    s.includes("Q") ||
+    s.includes("PERIOD") ||
+    s.includes("HALFTIME")
+  );
 }
 
 function isFinished(status) {
@@ -48,7 +56,7 @@ function isFinished(status) {
   return s === "FT" || s.includes("FINAL") || s.includes("CLOSED");
 }
 
-function isNotStarted(status) {
+function isUpcoming(status) {
   const s = String(status || "").toUpperCase();
   return s.includes("SCHEDULED") || s.includes("PRE") || s.includes("AM") || s.includes("PM");
 }
@@ -58,7 +66,7 @@ function gameTitle(g) {
 }
 
 function scoreLine(g) {
-  const hasScore = g.homeScore !== null && g.awayScore !== null;
+  const hasScore = g.homeScore !== null && g.awayScore !== null && g.homeScore !== undefined && g.awayScore !== undefined;
   if (!hasScore) return "";
   if (g.sport === "soccer" && g.penalties && g.penalties.homePens != null && g.penalties.awayPens != null) {
     return `${g.awayScore}-${g.homeScore} (pens ${g.penalties.awayPens}-${g.penalties.homePens})`;
@@ -66,42 +74,17 @@ function scoreLine(g) {
   return `${g.awayScore}-${g.homeScore}`;
 }
 
-function Chip({ active, onClick, children }) {
-  return (
-    <button
-      onClick={onClick}
-      style={{
-        padding: "10px 12px",
-        borderRadius: 10,
-        border: "1px solid #ddd",
-        background: active ? "#111" : "#fff",
-        color: active ? "#fff" : "#111",
-        fontWeight: active ? "700" : "500",
-        cursor: "pointer",
-      }}
-    >
-      {children}
-    </button>
-  );
-}
-
 export default function App() {
   // ---------- Login ----------
   const [username, setUsername] = useState(localStorage.getItem("wb_username") || "");
   const [step, setStep] = useState(username ? "lobby" : "enterName"); // enterName | lobby | room
-
-  function logout() {
-    localStorage.removeItem("wb_username");
-    setUsername("");
-    setStep("enterName");
-  }
 
   // ---------- Lobby ----------
   const [sport, setSport] = useState("soccer");
   const [date, setDate] = useState(todayISO());
   const [tab, setTab] = useState("all"); // all | live | finished
 
-  // Soccer filters
+  // Soccer catalog
   const [catalog, setCatalog] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [region, setRegion] = useState("");
@@ -113,12 +96,6 @@ export default function App() {
   const [loadingGames, setLoadingGames] = useState(false);
   const [apiError, setApiError] = useState("");
 
-  // Summary modal
-  const [showDetails, setShowDetails] = useState(false);
-  const [detailsLoading, setDetailsLoading] = useState(false);
-  const [detailsError, setDetailsError] = useState("");
-  const [detailsData, setDetailsData] = useState(null);
-
   // Room
   const [roomId, setRoomId] = useState("");
   const [selectedGame, setSelectedGame] = useState(null);
@@ -129,7 +106,7 @@ export default function App() {
   // Chat
   const [text, setText] = useState("");
 
-  // Betting UI (private only)
+  // Betting UI
   const [betTarget, setBetTarget] = useState(null);
   const [betTitle, setBetTitle] = useState("");
   const [betStake, setBetStake] = useState(100);
@@ -137,24 +114,30 @@ export default function App() {
   const [acceptPick, setAcceptPick] = useState("");
   const [acceptStake, setAcceptStake] = useState(100);
 
-  // Join Private by code (per-game)
+  // Join private by code (3rd button)
   const [showJoinPrivate, setShowJoinPrivate] = useState(false);
   const [joinCode, setJoinCode] = useState("");
-  const [joinForGameId, setJoinForGameId] = useState("");
 
   // WebRTC (private only)
   const [videoEnabled, setVideoEnabled] = useState(false);
   const [localStream, setLocalStream] = useState(null);
-  const peersRef = useRef({});
-  const remoteVideoRefs = useRef({});
+  const [iceServers, setIceServers] = useState([{ urls: ["stun:stun.l.google.com:19302"] }]);
 
+  const peersRef = useRef({}); // peerId -> Peer
+  const remoteVideoRefs = useRef({}); // peerId -> video element
   const scrollRef = useRef(null);
 
-  function isPrivateRoom(rid) {
-    return String(rid || "").startsWith("private:");
+  // ---------- Load ICE servers (Twilio TURN) ----------
+  async function loadIce() {
+    try {
+      const res = await axios.get(`${BACKEND}/api/ice`);
+      if (res?.data?.iceServers?.length) setIceServers(res.data.iceServers);
+    } catch {
+      // keep fallback
+    }
   }
 
-  // ---------- Load catalog ----------
+  // ---------- Catalog ----------
   async function loadCatalog() {
     setLoadingCatalog(true);
     try {
@@ -168,10 +151,11 @@ export default function App() {
   }
 
   useEffect(() => {
+    loadIce();
     loadCatalog();
   }, []);
 
-  // ---------- Load games ----------
+  // ---------- Games ----------
   async function loadGames() {
     setLoadingGames(true);
     setApiError("");
@@ -196,7 +180,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, sport, date, leagueCode]);
 
-  // ---------- Dropdown data ----------
+  // Soccer dropdown lists
   const regions = useMemo(() => catalog.map((r) => r.region), [catalog]);
 
   const countries = useMemo(() => {
@@ -210,21 +194,25 @@ export default function App() {
     return c ? c.leagues : [];
   }, [catalog, region, country]);
 
-  // ---------- Filter games ----------
+  // Filtered games:
+  // - Live tab: only live
+  // - Finished tab: only finished
+  // - All today: LIVE first, FINISHED next, UPCOMING last
   const filteredGames = useMemo(() => {
     const list = games || [];
     if (tab === "live") return list.filter((g) => isLive(g.status));
     if (tab === "finished") return list.filter((g) => isFinished(g.status));
 
-    const live = list.filter((g) => isLive(g.status));
-    const fin = list.filter((g) => isFinished(g.status));
-    const rest = list.filter((g) => !isLive(g.status) && !isFinished(g.status));
+    const live = list.filter((g) => isLive(g.status)).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    const finished = list
+      .filter((g) => isFinished(g.status))
+      .sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+    const upcoming = list
+      .filter((g) => !isLive(g.status) && !isFinished(g.status))
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
 
-    return [
-      ...live,
-      ...rest.sort((a, b) => new Date(a.startTime) - new Date(b.startTime)),
-      ...fin.sort((a, b) => new Date(b.startTime) - new Date(a.startTime)),
-    ];
+    // user asked: live first, ended next, starting soon last
+    return [...live, ...finished, ...upcoming];
   }, [games, tab]);
 
   // Clear soccer filters when leaving soccer
@@ -236,7 +224,7 @@ export default function App() {
     }
   }, [sport]);
 
-  // ---------- Socket listeners ----------
+  // ---------- Socket room listeners ----------
   useEffect(() => {
     if (step !== "room") return;
 
@@ -253,9 +241,11 @@ export default function App() {
       if (st.match) setSelectedGame(st.match);
     };
 
-    const onPeerJoined = ({ peerId }) => {
+    const onVideoPeer = ({ peerId, initiator }) => {
       if (!videoEnabled || !localStream) return;
-      createPeer(peerId, true);
+      if (!peerId) return;
+      if (peersRef.current[peerId]) return;
+      createPeer(peerId, initiator);
     };
 
     const onPeerLeft = ({ peerId }) => {
@@ -267,40 +257,54 @@ export default function App() {
     };
 
     const onSignal = ({ from, data }) => {
-      if (!videoEnabled || !localStream) return;
-      let p = peersRef.current[from];
-      if (!p) p = createPeer(from, false);
-      try {
-        p.signal(data);
-      } catch {}
+      if (!from || !data) return;
+      const p = peersRef.current[from];
+      if (p) {
+        try {
+          p.signal(data);
+        } catch {}
+      }
     };
 
     socket.on("message", onMessage);
     socket.on("room-state", onRoomState);
-    socket.on("peer-joined", onPeerJoined);
-    socket.on("peer-left", onPeerLeft);
+    socket.on("video-peer", onVideoPeer);
+    socket.on("video-peer-left", onPeerLeft);
     socket.on("signal", onSignal);
 
     return () => {
       socket.off("message", onMessage);
       socket.off("room-state", onRoomState);
-      socket.off("peer-joined", onPeerJoined);
-      socket.off("peer-left", onPeerLeft);
+      socket.off("video-peer", onVideoPeer);
+      socket.off("video-peer-left", onPeerLeft);
       socket.off("signal", onSignal);
     };
   }, [step, videoEnabled, localStream]);
 
-  // ---------- WebRTC ----------
-  function stopVideo() {
-    setVideoEnabled(false);
+  // ---------- WebRTC helpers ----------
+  function isPrivateRoom(rid) {
+    return String(rid || "").startsWith("private:");
+  }
+
+  function cleanupPeers() {
     Object.values(peersRef.current).forEach((p) => {
       try {
         p.destroy();
       } catch {}
     });
     peersRef.current = {};
+    remoteVideoRefs.current = {};
+  }
 
-    if (localStream) localStream.getTracks().forEach((t) => t.stop());
+  function stopVideo() {
+    setVideoEnabled(false);
+    socket.emit("video-stop", { roomId });
+
+    cleanupPeers();
+
+    if (localStream) {
+      localStream.getTracks().forEach((t) => t.stop());
+    }
     setLocalStream(null);
   }
 
@@ -309,10 +313,11 @@ export default function App() {
       initiator,
       trickle: true,
       stream: localStream,
+      config: { iceServers },
     });
 
     peer.on("signal", (data) => {
-      socket.emit("signal", { to: peerId, from: socket.id, data });
+      socket.emit("signal", { to: peerId, data });
     });
 
     peer.on("stream", (stream) => {
@@ -330,22 +335,23 @@ export default function App() {
     });
 
     peer.on("error", () => {});
+
     peersRef.current[peerId] = peer;
     return peer;
   }
 
   async function startVideo() {
     if (!isPrivateRoom(roomId)) return;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setVideoEnabled(true);
 
-      users
-        .filter((u) => u.id && u.username !== username)
-        .forEach((u) => createPeer(u.id, true));
+      // Tell server you are ready; server will pair you with others
+      socket.emit("video-ready", { roomId });
     } catch {
-      alert("Could not start camera/mic. Check permissions.");
+      alert("Could not start camera/mic. Check browser permissions.");
     }
   }
 
@@ -357,53 +363,52 @@ export default function App() {
     setStep("lobby");
   }
 
-  function joinPublic(game) {
-    const rid = `public:${sport}:${game.id}`;
+  function logout() {
+    stopVideo();
+    localStorage.removeItem("wb_username");
+    setUsername("");
+    setStep("enterName");
+    setRoomId("");
+  }
+
+  function enterRoom(rid, game) {
     setRoomId(rid);
-    setSelectedGame(game);
+    setSelectedGame(game || null);
     setUsers([]);
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
+    setShowJoinPrivate(false);
+    setJoinCode("");
     stopVideo();
+
     socket.emit("joinRoom", { roomId: rid, username, match: game });
     setStep("room");
+  }
+
+  function joinPublic(game) {
+    const rid = `public:${sport}:${game.id}`;
+    enterRoom(rid, game);
   }
 
   function createPrivate(game) {
     const code = Math.random().toString(36).slice(2, 8).toUpperCase();
     const rid = `private:${code}`;
-    setRoomId(rid);
-    setSelectedGame(game);
-    setUsers([]);
-    setBets([]);
-    setMessages([]);
-    setBetTarget(null);
-    stopVideo();
-    socket.emit("joinRoom", { roomId: rid, username, match: game });
-    setStep("room");
+    enterRoom(rid, game);
   }
 
-  function openJoinPrivate(game) {
+  function openJoinPrivateByCode(game) {
+    setSelectedGame(game);
     setShowJoinPrivate(true);
     setJoinCode("");
-    setJoinForGameId(game.id);
-    setSelectedGame(game);
   }
 
   function confirmJoinPrivate() {
     const code = joinCode.trim().toUpperCase();
     if (!code) return;
     const rid = `private:${code}`;
-    setRoomId(rid);
-    setUsers([]);
-    setBets([]);
-    setMessages([]);
-    setBetTarget(null);
-    stopVideo();
-    socket.emit("joinRoom", { roomId: rid, username, match: selectedGame });
-    setStep("room");
-    setShowJoinPrivate(false);
+    enterRoom(rid, selectedGame);
   }
 
   function sendMessage() {
@@ -423,7 +428,8 @@ export default function App() {
 
   function createOffer() {
     if (!betTarget) return;
-    if (!betTitle.trim() || !betPick.trim()) return;
+    if (!betTitle.trim()) return;
+    if (!betPick.trim()) return;
     socket.emit("createBetOffer", {
       roomId,
       targetUserId: betTarget.id,
@@ -447,26 +453,7 @@ export default function App() {
     socket.emit("cancelBetOffer", { roomId, betId: b.id });
   }
 
-  async function openDetails(game) {
-    setShowDetails(true);
-    setDetailsLoading(true);
-    setDetailsError("");
-    setDetailsData(null);
-
-    try {
-      const params = { sport: game.sport, eventId: game.id };
-      if (game.sport === "soccer") params.leagueCode = game.leagueCode || leagueCode; // best effort
-      const res = await axios.get(`${BACKEND}/api/summary`, { params });
-      setDetailsData(res.data.data);
-    } catch (e) {
-      const msg = e?.response?.data?.details || e?.response?.data?.error || e?.message || "Failed";
-      setDetailsError(String(msg));
-    } finally {
-      setDetailsLoading(false);
-    }
-  }
-
-  // ---------- UI: Login ----------
+  // ---------- UI ----------
   if (step === "enterName") {
     return (
       <div style={{ padding: 30, fontFamily: "Arial, sans-serif", maxWidth: 520 }}>
@@ -480,27 +467,28 @@ export default function App() {
     );
   }
 
-  // ---------- UI: Lobby ----------
   if (step === "lobby") {
     return (
       <div style={{ height: "100vh", fontFamily: "Arial, sans-serif", padding: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <h1 style={{ margin: 0 }}>Lobby</h1>
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <div>
-              Logged in as <b>{username}</b>
-            </div>
-            <button onClick={logout} style={{ padding: "8px 10px" }}>
-              Log out
+          <div>
+            Logged in as <b>{username}</b> {"  "}
+            <button onClick={logout} style={{ marginLeft: 10 }}>
+              Logout
             </button>
           </div>
         </div>
 
         <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {SPORTS.map((s) => (
-            <Chip key={s.key} active={sport === s.key} onClick={() => setSport(s.key)}>
+            <button
+              key={s.key}
+              onClick={() => setSport(s.key)}
+              style={{ padding: 10, fontWeight: sport === s.key ? "bold" : "normal" }}
+            >
               {s.label}
-            </Chip>
+            </button>
           ))}
           <input type="date" value={date} onChange={(e) => setDate(e.target.value)} style={{ padding: 10 }} />
           <button onClick={loadGames} style={{ padding: 10 }}>
@@ -511,6 +499,7 @@ export default function App() {
         {sport === "soccer" ? (
           <div style={{ marginTop: 12, border: "1px solid #ddd", borderRadius: 10, padding: 12, maxWidth: 1100 }}>
             <div style={{ fontWeight: "bold", marginBottom: 8 }}>Soccer filters</div>
+
             {loadingCatalog ? <div>Loading regions/countries/leagues…</div> : null}
 
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
@@ -523,7 +512,7 @@ export default function App() {
                     setCountry("");
                     setLeagueCode("");
                   }}
-                  style={{ padding: 10, minWidth: 240 }}
+                  style={{ padding: 10, minWidth: 220 }}
                 >
                   <option value="">(All / Popular mix)</option>
                   {regions.map((r) => (
@@ -542,7 +531,7 @@ export default function App() {
                     setCountry(e.target.value);
                     setLeagueCode("");
                   }}
-                  style={{ padding: 10, minWidth: 260 }}
+                  style={{ padding: 10, minWidth: 240 }}
                   disabled={!region}
                 >
                   <option value="">{region ? "(Pick a country)" : "(Pick a region first)"}</option>
@@ -559,7 +548,7 @@ export default function App() {
                 <select
                   value={leagueCode}
                   onChange={(e) => setLeagueCode(e.target.value)}
-                  style={{ padding: 10, minWidth: 360 }}
+                  style={{ padding: 10, minWidth: 340 }}
                   disabled={!country}
                 >
                   <option value="">{country ? "(Pick a league)" : "(Pick a country first)"}</option>
@@ -586,21 +575,24 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 8, fontSize: 12, opacity: 0.8 }}>
-              Tip: Pick a league for clean results. Leave empty for “popular mix”.
+              Tip: Pick a league for the cleanest schedule. Leave empty to see a “popular mix”.
             </div>
           </div>
         ) : null}
 
         <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <Chip active={tab === "all"} onClick={() => setTab("all")}>
+          <button onClick={() => setTab("all")} style={{ padding: 10, fontWeight: tab === "all" ? "bold" : "normal" }}>
             All Today
-          </Chip>
-          <Chip active={tab === "live"} onClick={() => setTab("live")}>
+          </button>
+          <button onClick={() => setTab("live")} style={{ padding: 10, fontWeight: tab === "live" ? "bold" : "normal" }}>
             Live
-          </Chip>
-          <Chip active={tab === "finished"} onClick={() => setTab("finished")}>
+          </button>
+          <button
+            onClick={() => setTab("finished")}
+            style={{ padding: 10, fontWeight: tab === "finished" ? "bold" : "normal" }}
+          >
             Finished
-          </Chip>
+          </button>
         </div>
 
         <div style={{ marginTop: 12 }}>
@@ -609,10 +601,6 @@ export default function App() {
           {apiError ? (
             <div style={{ border: "2px solid #b00", padding: 10, borderRadius: 10, marginBottom: 10 }}>
               <b>Backend/API error:</b> {apiError}
-              <div style={{ marginTop: 6, fontSize: 12, opacity: 0.9 }}>
-                If this is “Network Error”, your frontend is pointing to the wrong backend URL.
-                Set <b>REACT_APP_BACKEND_URL</b> in your frontend env.
-              </div>
             </div>
           ) : null}
 
@@ -622,42 +610,44 @@ export default function App() {
             {filteredGames.length === 0 ? <div>No games found for this selection.</div> : null}
 
             {filteredGames.map((g) => {
-              const showScore = !isNotStarted(g.status) && scoreLine(g);
-
+              const showScore = scoreLine(g) && (isLive(g.status) || isFinished(g.status));
               return (
                 <div key={g.id} style={{ borderBottom: "1px solid #eee", padding: "10px 0" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                     <div>
                       <div style={{ fontWeight: "bold" }}>{gameTitle(g)}</div>
+
                       {showScore ? (
-                        <div style={{ marginTop: 4 }}>{showScore}</div>
+                        <div style={{ marginTop: 4 }}>{scoreLine(g)}</div>
                       ) : (
                         <div style={{ marginTop: 4, opacity: 0.8 }}>
                           {fmtTime(g.startTime)} {g.status ? `• ${g.status}` : ""}
                         </div>
                       )}
+
                       <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>
-                        {g.league ? `${g.league}` : ""} {g.country ? ` • ${g.country}` : ""}
+                        {g.league ? `${g.league}` : ""}
+                        {g.country ? ` • ${g.country}` : ""}
                       </div>
                     </div>
+
                     <div style={{ fontSize: 12, opacity: 0.75, textAlign: "right" }}>{g.status}</div>
                   </div>
 
                   <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <button onClick={() => joinPublic(g)}>Join Public (Chat)</button>
-                    <button onClick={() => openJoinPrivate(g)}>Join Private (Code)</button>
-                    <button onClick={() => createPrivate(g)}>Create Private</button>
-                    <button onClick={() => openDetails(g)}>Details</button>
+                    <button onClick={() => createPrivate(g)}>Create Private (Chat + Bets + Video)</button>
+                    <button onClick={() => openJoinPrivateByCode(g)}>Join Private (Code)</button>
                   </div>
 
-                  {showJoinPrivate && joinForGameId === g.id ? (
-                    <div style={{ marginTop: 10, border: "1px solid #aaa", borderRadius: 10, padding: 10, maxWidth: 520 }}>
+                  {showJoinPrivate && selectedGame?.id === g.id ? (
+                    <div style={{ marginTop: 10, border: "1px solid #aaa", borderRadius: 10, padding: 10, maxWidth: 480 }}>
                       <div style={{ fontWeight: "bold" }}>Enter private code</div>
                       <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                         <input
                           value={joinCode}
                           onChange={(e) => setJoinCode(e.target.value)}
-                          placeholder="Example: AB12CD"
+                          placeholder="Private code"
                           style={{ flex: 1, padding: 10 }}
                         />
                         <button onClick={confirmJoinPrivate}>Join</button>
@@ -665,7 +655,6 @@ export default function App() {
                           onClick={() => {
                             setShowJoinPrivate(false);
                             setJoinCode("");
-                            setJoinForGameId("");
                           }}
                         >
                           Cancel
@@ -678,60 +667,11 @@ export default function App() {
             })}
           </div>
         </div>
-
-        {showDetails ? (
-          <div
-            onClick={() => setShowDetails(false)}
-            style={{
-              position: "fixed",
-              inset: 0,
-              background: "rgba(0,0,0,0.5)",
-              display: "flex",
-              alignItems: "center",
-              justifyContent: "center",
-              padding: 14,
-            }}
-          >
-            <div
-              onClick={(e) => e.stopPropagation()}
-              style={{
-                width: "min(1000px, 96vw)",
-                maxHeight: "86vh",
-                overflowY: "auto",
-                background: "#fff",
-                borderRadius: 14,
-                padding: 14,
-              }}
-            >
-              <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-                <div style={{ fontWeight: "bold" }}>Game details</div>
-                <button onClick={() => setShowDetails(false)}>Close</button>
-              </div>
-
-              {detailsLoading ? <div style={{ marginTop: 10 }}>Loading details…</div> : null}
-              {detailsError ? (
-                <div style={{ marginTop: 10, border: "2px solid #b00", padding: 10, borderRadius: 10 }}>
-                  <b>Error:</b> {detailsError}
-                </div>
-              ) : null}
-
-              {!detailsLoading && !detailsError && detailsData ? (
-                <pre style={{ marginTop: 10, whiteSpace: "pre-wrap", fontSize: 12, background: "#fafafa", padding: 10, borderRadius: 10 }}>
-                  {JSON.stringify(detailsData, null, 2)}
-                </pre>
-              ) : null}
-
-              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-                This is ESPN “summary” raw data. Next step is to render it nicely (lineups/stats/boxscore) based on what fields exist for each sport.
-              </div>
-            </div>
-          </div>
-        ) : null}
       </div>
     );
   }
 
-  // ---------- UI: ROOM ----------
+  // ROOM
   const privateRoom = isPrivateRoom(roomId);
 
   return (
@@ -739,12 +679,7 @@ export default function App() {
       <div style={{ flex: 1, padding: 16, display: "flex", flexDirection: "column", gap: 12 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <div>
-            <b>Room:</b> {roomId}{" "}
-            {privateRoom ? (
-              <span style={{ fontSize: 12, opacity: 0.8, marginLeft: 8 }}>
-                (Share code: <b>{roomId.replace("private:", "")}</b>)
-              </span>
-            ) : null}
+            <b>Room:</b> {roomId}
             {selectedGame ? (
               <>
                 {" "}
@@ -752,10 +687,10 @@ export default function App() {
               </>
             ) : null}
           </div>
-
           <button
             onClick={() => {
               stopVideo();
+              socket.emit("leaveRoom", { roomId });
               setStep("lobby");
               setRoomId("");
             }}
@@ -810,7 +745,7 @@ export default function App() {
                     ))}
                 </>
               ) : (
-                <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF (private rooms only).</div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF. Click “Start Webcam + Mic” (private rooms only).</div>
               )}
             </div>
           </div>
@@ -834,8 +769,7 @@ export default function App() {
                     {u.username} {u.username === username ? "(you)" : ""}
                     <div style={{ fontSize: 12, opacity: 0.7 }}>Credits: {u.credits}</div>
                   </div>
-
-                  {privateRoom && u.username !== username ? (
+                  {u.username !== username ? (
                     <button onClick={() => openBetToUser(u)} style={{ height: 34 }}>
                       Offer Bet
                     </button>
@@ -845,68 +779,66 @@ export default function App() {
             </div>
           </div>
 
-          {privateRoom ? (
-            betTarget ? (
-              <div style={{ width: 360, border: "2px solid #111", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontWeight: "bold" }}>Bet offer to: {betTarget.username}</div>
-
-                <input value={betTitle} onChange={(e) => setBetTitle(e.target.value)} style={{ width: "100%", padding: 10, marginTop: 8 }} />
-                <input value={betPick} onChange={(e) => setBetPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10, marginTop: 8 }} />
-
-                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                  <input type="number" value={betStake} onChange={(e) => setBetStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
-                  <button onClick={createOffer} style={{ flex: 1 }}>
-                    Send offer
-                  </button>
-                </div>
-
-                <button onClick={() => setBetTarget(null)} style={{ marginTop: 8, width: "100%", padding: 10 }}>
-                  Close
+          {betTarget ? (
+            <div style={{ width: 360, border: "2px solid #111", borderRadius: 10, padding: 10 }}>
+              <div style={{ fontWeight: "bold" }}>Bet offer to: {betTarget.username}</div>
+              <input
+                value={betTitle}
+                onChange={(e) => setBetTitle(e.target.value)}
+                style={{ width: "100%", padding: 10, marginTop: 8 }}
+              />
+              <input
+                value={betPick}
+                onChange={(e) => setBetPick(e.target.value)}
+                placeholder="Your pick"
+                style={{ width: "100%", padding: 10, marginTop: 8 }}
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <input type="number" value={betStake} onChange={(e) => setBetStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
+                <button onClick={createOffer} style={{ flex: 1 }}>
+                  Send offer
                 </button>
               </div>
-            ) : (
-              <div style={{ width: 360, border: "1px dashed #aaa", borderRadius: 10, padding: 10 }}>
-                <div style={{ fontWeight: "bold" }}>Bets</div>
-                <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto" }}>
-                  {bets.length === 0 ? <div style={{ opacity: 0.7 }}>No bets yet.</div> : null}
-
-                  {bets.map((b) => (
-                    <div key={b.id} style={{ borderBottom: "1px solid #eee", paddingBottom: 10, marginBottom: 10 }}>
-                      <div style={{ fontWeight: "bold" }}>{b.title}</div>
-                      <div style={{ fontSize: 12, marginTop: 4 }}>
-                        {b.creatorName} → {b.targetName} • stake {b.creatorStake}
-                      </div>
-                      <div style={{ fontSize: 12, marginTop: 4 }}>
-                        Status: <b>{b.status}</b>
-                      </div>
-
-                      {b.status === "pending" && b.creatorName === username ? (
-                        <button onClick={() => cancelOffer(b)} style={{ marginTop: 6 }}>
-                          Cancel
-                        </button>
-                      ) : null}
-
-                      {b.status === "pending" && b.targetName === username ? (
-                        <div style={{ marginTop: 6 }}>
-                          <input value={acceptPick} onChange={(e) => setAcceptPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10 }} />
-                          <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
-                            <input type="number" value={acceptStake} onChange={(e) => setAcceptStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
-                            <button onClick={() => acceptOffer(b)} style={{ flex: 1 }}>
-                              Accept
-                            </button>
-                          </div>
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            )
+              <button onClick={() => setBetTarget(null)} style={{ marginTop: 8, width: "100%", padding: 10 }}>
+                Close
+              </button>
+            </div>
           ) : (
-            <div style={{ width: 360, border: "1px dashed #aaa", borderRadius: 10, padding: 10, opacity: 0.75 }}>
-              <div style={{ fontWeight: "bold" }}>Public room</div>
-              <div style={{ marginTop: 6, fontSize: 12 }}>
-                Public rooms are chat-only. Private rooms have webcam + betting.
+            <div style={{ width: 360, border: "1px dashed #aaa", borderRadius: 10, padding: 10, opacity: 0.95 }}>
+              <div style={{ fontWeight: "bold" }}>Bets</div>
+
+              <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto" }}>
+                {bets.length === 0 ? <div style={{ opacity: 0.7 }}>No bets yet.</div> : null}
+
+                {bets.map((b) => (
+                  <div key={b.id} style={{ borderBottom: "1px solid #eee", paddingBottom: 10, marginBottom: 10 }}>
+                    <div style={{ fontWeight: "bold" }}>{b.title}</div>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>
+                      {b.creatorName} → {b.targetName} • stake {b.creatorStake}
+                    </div>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>
+                      Status: <b>{b.status}</b>
+                    </div>
+
+                    {b.status === "pending" && b.creatorName === username ? (
+                      <button onClick={() => cancelOffer(b)} style={{ marginTop: 6 }}>
+                        Cancel
+                      </button>
+                    ) : null}
+
+                    {b.status === "pending" && b.targetName === username ? (
+                      <div style={{ marginTop: 6 }}>
+                        <input value={acceptPick} onChange={(e) => setAcceptPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10 }} />
+                        <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
+                          <input type="number" value={acceptStake} onChange={(e) => setAcceptStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
+                          <button onClick={() => acceptOffer(b)} style={{ flex: 1 }}>
+                            Accept
+                          </button>
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                ))}
               </div>
             </div>
           )}
