@@ -5,7 +5,16 @@ const http = require("http");
 const cors = require("cors");
 const axios = require("axios");
 const { Server } = require("socket.io");
-const twilio = require("twilio");
+
+let twilioClient = null;
+try {
+  const twilio = require("twilio");
+  if (process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN) {
+    twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+  }
+} catch {
+  // twilio not installed - ICE endpoint will fall back to STUN only
+}
 
 const app = express();
 app.use(express.json());
@@ -14,14 +23,16 @@ app.use(express.json());
 function parseAllowedOrigins() {
   const env = (process.env.FRONTEND_URL || "").trim();
   const list = env ? env.split(",").map((s) => s.trim()).filter(Boolean) : [];
-  list.push("http://localhost:3001", "http://127.0.0.1:3001");
+  list.push("http://localhost:3001");
+  list.push("http://127.0.0.1:3001");
   return Array.from(new Set(list));
 }
+
 const allowedOrigins = parseAllowedOrigins();
 
 app.use(
   cors({
-    origin(origin, cb) {
+    origin: function (origin, cb) {
       if (!origin) return cb(null, true);
       if (allowedOrigins.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked origin: ${origin}`));
@@ -34,37 +45,13 @@ app.use(
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin(origin, cb) {
+    origin: function (origin, cb) {
       if (!origin) return cb(null, true);
       if (allowedOrigins.includes(origin)) return cb(null, true);
       return cb(new Error(`Socket CORS blocked origin: ${origin}`));
     },
     credentials: true,
   },
-});
-
-// -------------------- Twilio ICE (TURN) --------------------
-const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
-const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
-const twilioClient =
-  TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN
-    ? twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-    : null;
-
-// Frontend will call this to get TURN/STUN servers
-app.get("/api/ice", async (req, res) => {
-  try {
-    if (!twilioClient) {
-      return res.status(500).json({
-        error: "Twilio not configured",
-        details: "Missing TWILIO_ACCOUNT_SID or TWILIO_AUTH_TOKEN",
-      });
-    }
-    const token = await twilioClient.tokens.create();
-    return res.json({ iceServers: token.iceServers || [] });
-  } catch (e) {
-    return res.status(500).json({ error: "ICE failed", details: e?.message || String(e) });
-  }
 });
 
 // -------------------- ESPN helpers --------------------
@@ -75,22 +62,31 @@ function yyyymmddFromISO(isoDate) {
   if (!y || !m || !d) return null;
   return `${y}${m}${d}`;
 }
+
 function safeNum(x) {
   const n = Number(x);
   return Number.isFinite(n) ? n : null;
 }
+
 function normalizeStatus(detail, state) {
   const d = String(detail || "").toUpperCase();
   const s = String(state || "").toUpperCase();
+
+  // Soccer
   if (d.includes("FULL") || d === "FT" || d.includes("FINAL")) return "FT";
   if (d.includes("HALF") || d === "HT") return "HT";
   if (d.includes("AET")) return "AET";
   if (d.includes("PENS")) return "PENS";
+
+  // Other sports
+  if (d.includes("HALF")) return "HALFTIME";
   if (d.includes("FINAL")) return "FINAL";
   if (s === "IN") return "LIVE";
   if (s === "PRE") return "SCHEDULED";
+
   return detail || state || "";
 }
+
 function pickSoccerPens(comp) {
   try {
     const competitors = comp?.competitors || [];
@@ -104,6 +100,7 @@ function pickSoccerPens(comp) {
     return null;
   }
 }
+
 function mapEspnEventToGame({ event, sportKey, leagueLabel, country, leagueCode }) {
   const comp = event?.competitions?.[0];
   const competitors = comp?.competitors || [];
@@ -197,35 +194,73 @@ function buildSoccerCatalogTree() {
     countriesArr.sort((a, b) => a.country.localeCompare(b.country));
     out.push({ region, countries: countriesArr });
   }
-  return out;
+  return out.sort((a, b) => a.region.localeCompare(b.region));
 }
 
-// -------------------- ESPN fetchers --------------------
 async function fetchScoreboardNonSoccer({ sportPath, label, country, isoDate, sportKey }) {
   const dates = yyyymmddFromISO(isoDate);
   if (!dates) throw new Error("Bad date (must be YYYY-MM-DD)");
+
   const url = `${ESPN_BASE}/sports/${sportPath}/scoreboard?dates=${dates}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
+  const { data } = await axios.get(url, { timeout: 20000 });
+
   const events = data?.events || [];
   return events.map((event) =>
-    mapEspnEventToGame({ event, sportKey, leagueLabel: label, country, leagueCode: "" })
+    mapEspnEventToGame({
+      event,
+      sportKey,
+      leagueLabel: label,
+      country,
+      leagueCode: "",
+    })
   );
 }
 
 async function fetchSoccerLeague({ leagueCode, leagueLabel, country, isoDate }) {
   const dates = yyyymmddFromISO(isoDate);
   if (!dates) throw new Error("Bad date (must be YYYY-MM-DD)");
+
   const url = `${ESPN_BASE}/sports/soccer/${encodeURIComponent(leagueCode)}/scoreboard?dates=${dates}`;
-  const { data } = await axios.get(url, { timeout: 15000 });
+  const { data } = await axios.get(url, { timeout: 20000 });
+
   const events = data?.events || [];
   return events.map((event) =>
-    mapEspnEventToGame({ event, sportKey: "soccer", leagueLabel, country, leagueCode })
+    mapEspnEventToGame({
+      event,
+      sportKey: "soccer",
+      leagueLabel,
+      country,
+      leagueCode,
+    })
   );
 }
 
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("Backend is running 🚀"));
-app.get("/api/health", (req, res) => res.json({ ok: true, allowedOrigins }));
+
+app.get("/api/health", (req, res) => {
+  res.json({ ok: true, allowedOrigins, hasTwilio: Boolean(twilioClient) });
+});
+
+// ✅ ICE servers for WebRTC (TURN)
+app.get("/api/ice", async (req, res) => {
+  try {
+    if (twilioClient) {
+      const token = await twilioClient.tokens.create();
+      return res.json({ iceServers: token.iceServers || [] });
+    }
+
+    // Fallback STUN only
+    return res.json({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:global.stun.twilio.com:3478" }],
+    });
+  } catch (e) {
+    return res.json({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+      error: e?.message || "ICE fetch failed",
+    });
+  }
+});
 
 app.get("/api/catalog", (req, res) => {
   const sport = String(req.query.sport || "soccer");
@@ -252,11 +287,16 @@ app.get("/api/games", async (req, res) => {
       });
 
       const settled = await Promise.allSettled(tasks);
+
       const all = [];
       for (let i = 0; i < settled.length; i++) {
         const r = settled[i];
         if (r.status === "fulfilled") all.push(...r.value);
-        else console.log("ESPN soccer league failed:", codes[i], r.reason?.response?.status || r.reason?.message);
+        else {
+          const code = codes[i];
+          const status = r.reason?.response?.status;
+          console.log("ESPN soccer league failed:", code, status || r.reason?.message || r.reason);
+        }
       }
 
       const seen = new Set();
@@ -277,6 +317,7 @@ app.get("/api/games", async (req, res) => {
       nhl: { sportPath: "hockey/nhl", label: "NHL", country: "United States/Canada" },
       mlb: { sportPath: "baseball/mlb", label: "MLB", country: "United States" },
     };
+
     if (!map[sport]) return res.json({ games: [] });
 
     const meta = map[sport];
@@ -288,8 +329,15 @@ app.get("/api/games", async (req, res) => {
       sportKey: sport,
     });
 
-    games.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    return res.json({ games });
+    const cleaned = games.map((g) => {
+      const st = String(g.status || "").toUpperCase();
+      const notStarted = st.includes("SCHEDULED") || st.includes("PRE") || st.includes("AM") || st.includes("PM");
+      if (notStarted) return { ...g, homeScore: null, awayScore: null };
+      return g;
+    });
+
+    cleaned.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    return res.json({ games: cleaned });
   } catch (err) {
     const status = err?.response?.status;
     return res.status(500).json({
@@ -308,10 +356,12 @@ function getOrCreateRoom(roomId) {
       bets: [],
       match: null,
       videoAllowed: String(roomId || "").startsWith("private:"),
+      videoReady: new Set(), // socket ids that clicked "Start Webcam"
     });
   }
   return roomState.get(roomId);
 }
+
 function emitRoom(roomId) {
   const st = roomState.get(roomId);
   if (!st) return;
@@ -320,6 +370,7 @@ function emitRoom(roomId) {
     bets: st.bets,
     match: st.match,
     videoAllowed: st.videoAllowed,
+    videoReadyIds: Array.from(st.videoReady),
   });
 }
 
@@ -345,26 +396,90 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("message", { user, text });
   });
 
+  // ✅ WebRTC signaling pass-through
   socket.on("signal", ({ to, from, data }) => {
     if (!to || !data) return;
     io.to(to).emit("signal", { from, data });
   });
 
-  // 🔥 When someone enables video, notify others to connect to them
+  // ✅ When someone clicks "Start Webcam", tell others to connect to them
   socket.on("video-ready", ({ roomId }) => {
-    if (!roomId) return;
+    const st = roomState.get(roomId);
+    if (!st) return;
+    st.videoReady.add(socket.id);
     socket.to(roomId).emit("video-ready", { peerId: socket.id });
+    emitRoom(roomId);
+  });
+
+  // Bets
+  socket.on("createBetOffer", ({ roomId, targetUserId, title, stake, pick }) => {
+    const st = roomState.get(roomId);
+    if (!st) return;
+
+    const me = st.users.find((u) => u.id === socket.id);
+    const target = st.users.find((u) => u.id === targetUserId);
+    if (!me || !target) return;
+
+    const betId = `bet_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+
+    st.bets.push({
+      id: betId,
+      status: "pending",
+      title: String(title || "Bet"),
+      creatorId: me.id,
+      creatorName: me.username,
+      targetId: target.id,
+      targetName: target.username,
+      creatorStake: Number(stake || 0),
+      targetStake: Number(stake || 0),
+      creatorPick: String(pick || ""),
+      winnerName: "",
+    });
+
+    emitRoom(roomId);
+    io.to(roomId).emit("message", { user: "System", text: `${me.username} offered a bet to ${target.username}` });
+  });
+
+  socket.on("acceptBetOffer", ({ roomId, betId, targetPick, targetStake }) => {
+    const st = roomState.get(roomId);
+    if (!st) return;
+
+    const bet = st.bets.find((b) => b.id === betId);
+    if (!bet || bet.status !== "pending") return;
+    if (socket.id !== bet.targetId) return;
+
+    bet.status = "active";
+    bet.targetPick = String(targetPick || "ACCEPT");
+    bet.targetStake = Number(targetStake || bet.targetStake);
+
+    emitRoom(roomId);
+    io.to(roomId).emit("message", { user: "System", text: `${bet.targetName} accepted the bet!` });
+  });
+
+  socket.on("cancelBetOffer", ({ roomId, betId }) => {
+    const st = roomState.get(roomId);
+    if (!st) return;
+    const bet = st.bets.find((b) => b.id === betId);
+    if (!bet || bet.status !== "pending") return;
+    if (socket.id !== bet.creatorId) return;
+
+    bet.status = "cancelled";
+    emitRoom(roomId);
   });
 
   socket.on("disconnect", () => {
     for (const [roomId, st] of roomState.entries()) {
       const before = st.users.length;
+
       st.users = st.users.filter((u) => u.id !== socket.id);
+      st.videoReady.delete(socket.id);
+
       if (st.users.length !== before) {
         socket.to(roomId).emit("peer-left", { peerId: socket.id });
         io.to(roomId).emit("message", { user: "System", text: `Someone left` });
         emitRoom(roomId);
       }
+
       if (st.users.length === 0) roomState.delete(roomId);
     }
   });

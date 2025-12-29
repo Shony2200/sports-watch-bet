@@ -27,11 +27,7 @@ function todayISO() {
 function fmtTime(iso) {
   if (!iso) return "";
   try {
-    return new Intl.DateTimeFormat("en-US", {
-      timeZone: TZ,
-      hour: "numeric",
-      minute: "2-digit",
-    }).format(new Date(iso));
+    return new Intl.DateTimeFormat("en-US", { timeZone: TZ, hour: "numeric", minute: "2-digit" }).format(new Date(iso));
   } catch {
     return "";
   }
@@ -39,19 +35,29 @@ function fmtTime(iso) {
 
 function isLive(status) {
   const s = String(status || "").toUpperCase();
-  return s.includes("LIVE") || s.includes("IN PROGRESS") || s.includes("Q") || s.includes("PERIOD");
+  return (
+    s.includes("LIVE") ||
+    s.includes("IN PROGRESS") ||
+    s.includes("Q") ||
+    s.includes("PERIOD") ||
+    s.includes("HALF") // ✅ halftime counts as live
+  );
 }
+
 function isFinished(status) {
   const s = String(status || "").toUpperCase();
   return s === "FT" || s.includes("FINAL") || s.includes("CLOSED");
 }
+
 function isNotStarted(status) {
   const s = String(status || "").toUpperCase();
   return s.includes("SCHEDULED") || s.includes("PRE") || s.includes("AM") || s.includes("PM");
 }
+
 function gameTitle(g) {
   return `${g.away} vs ${g.home}`;
 }
+
 function scoreLine(g) {
   const hasScore = g.homeScore !== null && g.awayScore !== null;
   if (!hasScore) return "";
@@ -67,7 +73,7 @@ export default function App() {
 
   const [sport, setSport] = useState("soccer");
   const [date, setDate] = useState(todayISO());
-  const [tab, setTab] = useState("all"); // all | live | finished
+  const [tab, setTab] = useState("all");
 
   const [catalog, setCatalog] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
@@ -84,6 +90,7 @@ export default function App() {
   const [users, setUsers] = useState([]);
   const [bets, setBets] = useState([]);
   const [messages, setMessages] = useState([]);
+
   const [text, setText] = useState("");
 
   const [betTarget, setBetTarget] = useState(null);
@@ -96,19 +103,34 @@ export default function App() {
   const [showJoinPrivate, setShowJoinPrivate] = useState(false);
   const [joinCode, setJoinCode] = useState("");
 
-  // ✅ TURN / ICE servers
-  const [iceServers, setIceServers] = useState([]);
-
+  // WebRTC
   const [videoEnabled, setVideoEnabled] = useState(false);
   const [localStream, setLocalStream] = useState(null);
+  const [iceServers, setIceServers] = useState([]);
   const peersRef = useRef({});
   const remoteVideoRefs = useRef({});
+  const pendingSignalsRef = useRef({}); // peerId -> [signalData]
+
   const scrollRef = useRef(null);
 
+  function isPrivateRoom(rid) {
+    return String(rid || "").startsWith("private:");
+  }
+
+  async function loadIceServers() {
+    try {
+      const res = await axios.get(`${BACKEND}/api/ice`, { timeout: 15000 });
+      setIceServers(res.data.iceServers || []);
+    } catch {
+      setIceServers([{ urls: "stun:stun.l.google.com:19302" }]);
+    }
+  }
+
+  // Catalog
   async function loadCatalog() {
     setLoadingCatalog(true);
     try {
-      const res = await axios.get(`${BACKEND}/api/catalog`, { params: { sport: "soccer" } });
+      const res = await axios.get(`${BACKEND}/api/catalog`, { params: { sport: "soccer" }, timeout: 15000 });
       setCatalog(res.data.regions || []);
     } catch {
       setCatalog([]);
@@ -117,13 +139,20 @@ export default function App() {
     }
   }
 
+  useEffect(() => {
+    loadCatalog();
+    loadIceServers();
+  }, []);
+
+  // Games
   async function loadGames() {
     setLoadingGames(true);
     setApiError("");
     try {
       const params = { sport, date };
       if (sport === "soccer" && leagueCode) params.leagueCode = leagueCode;
-      const res = await axios.get(`${BACKEND}/api/games`, { params, timeout: 20000 });
+
+      const res = await axios.get(`${BACKEND}/api/games`, { params, timeout: 25000 });
       setGames(res.data.games || []);
     } catch (e) {
       const msg = e?.response?.data?.details || e?.response?.data?.error || e?.message || "Backend/API issue";
@@ -134,20 +163,6 @@ export default function App() {
     }
   }
 
-  async function loadIceServers() {
-    try {
-      const res = await axios.get(`${BACKEND}/api/ice`, { timeout: 15000 });
-      setIceServers(res.data.iceServers || []);
-    } catch (e) {
-      console.log("ICE failed:", e?.response?.data || e?.message);
-      setIceServers([]); // still try STUN-less; but TURN is needed for remote networks
-    }
-  }
-
-  useEffect(() => {
-    loadCatalog();
-  }, []);
-
   useEffect(() => {
     if (step !== "lobby") return;
     loadGames();
@@ -155,6 +170,7 @@ export default function App() {
   }, [step, sport, date, leagueCode]);
 
   const regions = useMemo(() => catalog.map((r) => r.region), [catalog]);
+
   const countries = useMemo(() => {
     const r = catalog.find((x) => x.region === region);
     return r ? r.countries.map((c) => c.country) : [];
@@ -190,61 +206,7 @@ export default function App() {
     }
   }, [sport]);
 
-  function isPrivateRoom(rid) {
-    return String(rid || "").startsWith("private:");
-  }
-
-  function stopVideo() {
-    setVideoEnabled(false);
-    Object.values(peersRef.current).forEach((p) => {
-      try {
-        p.destroy();
-      } catch {}
-    });
-    peersRef.current = {};
-    if (localStream) localStream.getTracks().forEach((t) => t.stop());
-    setLocalStream(null);
-  }
-
-  // ✅ stable “who initiates”
-  function amInitiator(otherId) {
-    // one side initiates only (prevents double-peers)
-    return String(socket.id || "") < String(otherId || "");
-  }
-
-  function createPeer(peerId) {
-    if (!localStream) return null;
-    if (peersRef.current[peerId]) return peersRef.current[peerId];
-
-    const peer = new Peer({
-      initiator: amInitiator(peerId),
-      trickle: true,
-      stream: localStream,
-      config: { iceServers: iceServers || [] }, // ✅ TURN HERE
-    });
-
-    peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
-
-    peer.on("stream", (stream) => {
-      setTimeout(() => {
-        const el = remoteVideoRefs.current[peerId];
-        if (el) el.srcObject = stream;
-      }, 0);
-    });
-
-    peer.on("close", () => {
-      delete peersRef.current[peerId];
-      delete remoteVideoRefs.current[peerId];
-      setVideoEnabled((v) => v);
-    });
-
-    peer.on("error", (e) => console.log("peer error", peerId, e?.message || e));
-
-    peersRef.current[peerId] = peer;
-    return peer;
-  }
-
-  // socket listeners
+  // ---------- Socket listeners ----------
   useEffect(() => {
     if (step !== "room") return;
 
@@ -261,24 +223,16 @@ export default function App() {
       if (st.match) setSelectedGame(st.match);
     };
 
-    const onSignal = ({ from, data }) => {
-      if (!localStream) return; // must have camera on to accept video
-      const p = createPeer(from);
-      try {
-        p?.signal(data);
-      } catch {}
-    };
-
-    // someone joined room
+    // Someone joined (may or may not have video yet)
     const onPeerJoined = ({ peerId }) => {
-      if (!localStream) return;
-      createPeer(peerId);
+      // If I'm already video-ready, start peer to them
+      if (videoEnabled && localStream) createPeer(peerId, true);
     };
 
-    // someone turned on video
+    // ✅ Someone clicked Start Webcam
     const onVideoReady = ({ peerId }) => {
-      if (!localStream) return;
-      createPeer(peerId);
+      // If I'm video-ready too, connect
+      if (videoEnabled && localStream) createPeer(peerId, true);
     };
 
     const onPeerLeft = ({ peerId }) => {
@@ -289,43 +243,117 @@ export default function App() {
       setVideoEnabled((v) => v);
     };
 
+    // ✅ Buffer signals if webcam not started yet (fixes “black screen forever”)
+    const onSignal = ({ from, data }) => {
+      if (!from || !data) return;
+
+      if (!videoEnabled || !localStream) {
+        if (!pendingSignalsRef.current[from]) pendingSignalsRef.current[from] = [];
+        pendingSignalsRef.current[from].push(data);
+        return;
+      }
+
+      let p = peersRef.current[from];
+      if (!p) p = createPeer(from, false);
+
+      try {
+        p.signal(data);
+      } catch {}
+    };
+
     socket.on("message", onMessage);
     socket.on("room-state", onRoomState);
-    socket.on("signal", onSignal);
     socket.on("peer-joined", onPeerJoined);
-    socket.on("video-ready", onVideoReady);
     socket.on("peer-left", onPeerLeft);
+    socket.on("signal", onSignal);
+    socket.on("video-ready", onVideoReady);
 
     return () => {
       socket.off("message", onMessage);
       socket.off("room-state", onRoomState);
-      socket.off("signal", onSignal);
       socket.off("peer-joined", onPeerJoined);
-      socket.off("video-ready", onVideoReady);
       socket.off("peer-left", onPeerLeft);
+      socket.off("signal", onSignal);
+      socket.off("video-ready", onVideoReady);
     };
-  }, [step, localStream, iceServers]);
+  }, [step, videoEnabled, localStream]);
+
+  function stopVideo() {
+    setVideoEnabled(false);
+
+    Object.values(peersRef.current).forEach((p) => {
+      try {
+        p.destroy();
+      } catch {}
+    });
+    peersRef.current = {};
+    pendingSignalsRef.current = {};
+
+    if (localStream) localStream.getTracks().forEach((t) => t.stop());
+    setLocalStream(null);
+  }
+
+  function createPeer(peerId, initiator) {
+    if (!peerId) return null;
+    if (peersRef.current[peerId]) return peersRef.current[peerId];
+
+    const peer = new Peer({
+      initiator,
+      trickle: true,
+      stream: localStream,
+      config: { iceServers: iceServers && iceServers.length ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }] },
+    });
+
+    peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
+
+    peer.on("stream", (stream) => {
+      setTimeout(() => {
+        const el = remoteVideoRefs.current[peerId];
+        if (el) el.srcObject = stream;
+      }, 0);
+    });
+
+    peer.on("close", () => {
+      delete peersRef.current[peerId];
+      delete remoteVideoRefs.current[peerId];
+    });
+
+    peer.on("error", () => {});
+
+    peersRef.current[peerId] = peer;
+
+    // If we buffered signals earlier, apply them now
+    const pending = pendingSignalsRef.current[peerId];
+    if (pending && pending.length) {
+      pending.forEach((sig) => {
+        try {
+          peer.signal(sig);
+        } catch {}
+      });
+      delete pendingSignalsRef.current[peerId];
+    }
+
+    return peer;
+  }
 
   async function startVideo() {
     if (!isPrivateRoom(roomId)) return;
 
-    // ✅ get ICE servers first (TURN)
-    if (!iceServers || iceServers.length === 0) {
-      await loadIceServers();
-    }
-
     try {
+      // refresh ICE each time (Twilio tokens expire)
+      await loadIceServers();
+
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setVideoEnabled(true);
 
-      // tell others “I’m ready for video”
+      // Tell others I'm ready
       socket.emit("video-ready", { roomId });
 
-      // connect to everyone currently in the room
+      // Connect to existing users
       users
         .filter((u) => u.id && u.username && u.username !== username)
-        .forEach((u) => createPeer(u.id));
+        .forEach((u) => createPeer(u.id, true));
     } catch {
       alert("Could not start camera/mic. Check browser permissions.");
     }
@@ -355,6 +383,7 @@ export default function App() {
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     setShowJoinPrivate(false);
     setJoinCode("");
     stopVideo();
@@ -371,6 +400,7 @@ export default function App() {
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     setShowJoinPrivate(false);
     setJoinCode("");
     stopVideo();
@@ -387,12 +417,14 @@ export default function App() {
   function confirmJoinPrivate() {
     const code = joinCode.trim().toUpperCase();
     if (!code) return;
+
     const rid = `private:${code}`;
     setRoomId(rid);
     setUsers([]);
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     stopVideo();
     socket.emit("joinRoom", { roomId: rid, username, match: selectedGame });
     setStep("room");
@@ -415,7 +447,9 @@ export default function App() {
   }
 
   function createOffer() {
-    if (!betTarget || !betTitle.trim() || !betPick.trim()) return;
+    if (!betTarget) return;
+    if (!betTitle.trim()) return;
+    if (!betPick.trim()) return;
     socket.emit("createBetOffer", {
       roomId,
       targetUserId: betTarget.id,
@@ -439,6 +473,7 @@ export default function App() {
     socket.emit("cancelBetOffer", { roomId, betId: b.id });
   }
 
+  // ---------- UI ----------
   if (step === "enterName") {
     return (
       <div style={{ padding: 30, fontFamily: "Arial, sans-serif", maxWidth: 520 }}>
@@ -485,20 +520,40 @@ export default function App() {
             <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
               <div>
                 <div style={{ fontSize: 12, opacity: 0.8 }}>Region</div>
-                <select value={region} onChange={(e) => { setRegion(e.target.value); setCountry(""); setLeagueCode(""); }} style={{ padding: 10, minWidth: 220 }}>
+                <select
+                  value={region}
+                  onChange={(e) => {
+                    setRegion(e.target.value);
+                    setCountry("");
+                    setLeagueCode("");
+                  }}
+                  style={{ padding: 10, minWidth: 220 }}
+                >
                   <option value="">(All / Popular mix)</option>
                   {regions.map((r) => (
-                    <option key={r} value={r}>{r}</option>
+                    <option key={r} value={r}>
+                      {r}
+                    </option>
                   ))}
                 </select>
               </div>
 
               <div>
                 <div style={{ fontSize: 12, opacity: 0.8 }}>Country</div>
-                <select value={country} onChange={(e) => { setCountry(e.target.value); setLeagueCode(""); }} style={{ padding: 10, minWidth: 240 }} disabled={!region}>
+                <select
+                  value={country}
+                  onChange={(e) => {
+                    setCountry(e.target.value);
+                    setLeagueCode("");
+                  }}
+                  style={{ padding: 10, minWidth: 240 }}
+                  disabled={!region}
+                >
                   <option value="">{region ? "(Pick a country)" : "(Pick a region first)"}</option>
                   {countries.map((c) => (
-                    <option key={c} value={c}>{c}</option>
+                    <option key={c} value={c}>
+                      {c}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -508,7 +563,9 @@ export default function App() {
                 <select value={leagueCode} onChange={(e) => setLeagueCode(e.target.value)} style={{ padding: 10, minWidth: 340 }} disabled={!country}>
                   <option value="">{country ? "(Pick a league)" : "(Pick a country first)"}</option>
                   {leagues.map((l) => (
-                    <option key={l.leagueCode} value={l.leagueCode}>{l.league}</option>
+                    <option key={l.leagueCode} value={l.leagueCode}>
+                      {l.league}
+                    </option>
                   ))}
                 </select>
               </div>
@@ -523,18 +580,26 @@ export default function App() {
         ) : null}
 
         <div style={{ marginTop: 12, display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button onClick={() => setTab("all")} style={{ padding: 10, fontWeight: tab === "all" ? "bold" : "normal" }}>All Today</button>
-          <button onClick={() => setTab("live")} style={{ padding: 10, fontWeight: tab === "live" ? "bold" : "normal" }}>Live</button>
-          <button onClick={() => setTab("finished")} style={{ padding: 10, fontWeight: tab === "finished" ? "bold" : "normal" }}>Finished</button>
+          <button onClick={() => setTab("all")} style={{ padding: 10, fontWeight: tab === "all" ? "bold" : "normal" }}>
+            All Today
+          </button>
+          <button onClick={() => setTab("live")} style={{ padding: 10, fontWeight: tab === "live" ? "bold" : "normal" }}>
+            Live
+          </button>
+          <button onClick={() => setTab("finished")} style={{ padding: 10, fontWeight: tab === "finished" ? "bold" : "normal" }}>
+            Finished
+          </button>
         </div>
 
         <div style={{ marginTop: 12 }}>
           <h2 style={{ marginTop: 0 }}>Games</h2>
+
           {apiError ? (
             <div style={{ border: "2px solid #b00", padding: 10, borderRadius: 10, marginBottom: 10 }}>
               <b>Backend/API error:</b> {apiError}
             </div>
           ) : null}
+
           {loadingGames ? <div>Loading…</div> : null}
 
           <div style={{ border: "1px solid #ddd", padding: 10, maxHeight: "70vh", overflowY: "auto" }}>
@@ -587,6 +652,7 @@ export default function App() {
     );
   }
 
+  // ROOM
   const privateRoom = isPrivateRoom(roomId);
 
   return (
@@ -595,7 +661,12 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <div>
             <b>Room:</b> {roomId}
-            {selectedGame ? <> • <b>{gameTitle(selectedGame)}</b></> : null}
+            {selectedGame ? (
+              <>
+                {" "}
+                • <b>{gameTitle(selectedGame)}</b>
+              </>
+            ) : null}
           </div>
           <button onClick={() => { stopVideo(); setStep("lobby"); setRoomId(""); }}>
             Back
@@ -625,36 +696,31 @@ export default function App() {
                       playsInline
                       muted
                       style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
-                      ref={(el) => {
-                        if (el && localStream) el.srcObject = localStream;
-                      }}
+                      ref={(el) => { if (el && localStream) el.srcObject = localStream; }}
                     />
                   </div>
 
-                  {users.filter((u) => u.id && u.username !== username).map((u) => (
-                    <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
-                      <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
-                      <video
-                        autoPlay
-                        playsInline
-                        style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
-                        ref={(el) => {
-                          if (el) remoteVideoRefs.current[u.id] = el;
-                        }}
-                      />
-                    </div>
-                  ))}
+                  {users
+                    .filter((u) => u.id && u.username !== username)
+                    .map((u) => (
+                      <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
+                        <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
+                        <video
+                          autoPlay
+                          playsInline
+                          style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
+                          ref={(el) => { if (el) remoteVideoRefs.current[u.id] = el; }}
+                        />
+                      </div>
+                    ))}
                 </>
               ) : (
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  Video is OFF. Click “Start Webcam + Mic”. (TURN is used automatically)
-                </div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF. Click “Start Webcam + Mic”.</div>
               )}
             </div>
           </div>
         ) : null}
 
-        {/* (rest of your room UI unchanged) */}
         <div style={{ display: "flex", gap: 12, minHeight: 120 }}>
           <div style={{ flex: 1, border: "1px solid #ddd", borderRadius: 10, padding: 10 }}>
             <div style={{ fontWeight: "bold" }}>People</div>
@@ -675,7 +741,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Bets panel (same as you already had) */}
           {betTarget ? (
             <div style={{ width: 360, border: "2px solid #111", borderRadius: 10, padding: 10 }}>
               <div style={{ fontWeight: "bold" }}>Bet offer to: {betTarget.username}</div>
@@ -690,8 +755,10 @@ export default function App() {
           ) : (
             <div style={{ width: 360, border: "1px dashed #aaa", borderRadius: 10, padding: 10, opacity: 0.95 }}>
               <div style={{ fontWeight: "bold" }}>Bets</div>
+
               <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto" }}>
                 {bets.length === 0 ? <div style={{ opacity: 0.7 }}>No bets yet.</div> : null}
+
                 {bets.map((b) => (
                   <div key={b.id} style={{ borderBottom: "1px solid #eee", paddingBottom: 10, marginBottom: 10 }}>
                     <div style={{ fontWeight: "bold" }}>{b.title}</div>
@@ -701,9 +768,11 @@ export default function App() {
                     <div style={{ fontSize: 12, marginTop: 4 }}>
                       Status: <b>{b.status}</b>
                     </div>
+
                     {b.status === "pending" && b.creatorName === username ? (
                       <button onClick={() => cancelOffer(b)} style={{ marginTop: 6 }}>Cancel</button>
                     ) : null}
+
                     {b.status === "pending" && b.targetName === username ? (
                       <div style={{ marginTop: 6 }}>
                         <input value={acceptPick} onChange={(e) => setAcceptPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10 }} />
@@ -734,9 +803,7 @@ export default function App() {
             onChange={(e) => setText(e.target.value)}
             placeholder="Type message"
             style={{ flex: 1, padding: 10 }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") sendMessage();
-            }}
+            onKeyDown={(e) => { if (e.key === "Enter") sendMessage(); }}
           />
           <button onClick={sendMessage}>Send</button>
         </div>
