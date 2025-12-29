@@ -3,7 +3,7 @@ import axios from "axios";
 import { io } from "socket.io-client";
 import Peer from "simple-peer";
 
-// ✅ IMPORTANT: for local dev keep localhost. For Vercel, set REACT_APP_BACKEND_URL in Vercel env.
+// ✅ For Vercel, set: REACT_APP_BACKEND_URL = https://your-railway-backend.up.railway.app
 const BACKEND = process.env.REACT_APP_BACKEND_URL || "http://localhost:3000";
 const socket = io(BACKEND, { transports: ["websocket", "polling"] });
 
@@ -40,15 +40,17 @@ function fmtTime(iso) {
 
 function isLive(status) {
   const s = String(status || "").toUpperCase();
-  return s === "LIVE" || s === "HT";
+  return s.includes("LIVE") || s.includes("IN PROGRESS") || s.includes("Q") || s.includes("PERIOD");
 }
+
 function isFinished(status) {
   const s = String(status || "").toUpperCase();
-  return s === "FT" || s.includes("FINAL");
+  return s === "FT" || s.includes("FINAL") || s.includes("CLOSED");
 }
-function isUpcoming(status) {
+
+function isNotStarted(status) {
   const s = String(status || "").toUpperCase();
-  return s === "SCHEDULED" || s.includes("PRE");
+  return s.includes("SCHEDULED") || s.includes("PRE") || s.includes("AM") || s.includes("PM");
 }
 
 function gameTitle(g) {
@@ -65,16 +67,16 @@ function scoreLine(g) {
 }
 
 export default function App() {
-  // ---- Login ----
+  // ✅ Always show username screen first unless saved
   const [username, setUsername] = useState(localStorage.getItem("wb_username") || "");
   const [step, setStep] = useState(username ? "lobby" : "enterName"); // enterName | lobby | room
 
-  // ---- Lobby state ----
+  // Lobby
   const [sport, setSport] = useState("soccer");
   const [date, setDate] = useState(todayISO());
   const [tab, setTab] = useState("all"); // all | live | finished
 
-  // Soccer filters
+  // Soccer catalog
   const [catalog, setCatalog] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
   const [region, setRegion] = useState("");
@@ -96,7 +98,7 @@ export default function App() {
   // Chat
   const [text, setText] = useState("");
 
-  // Bets
+  // Bets UI
   const [betTarget, setBetTarget] = useState(null);
   const [betTitle, setBetTitle] = useState("");
   const [betStake, setBetStake] = useState(100);
@@ -104,20 +106,19 @@ export default function App() {
   const [acceptPick, setAcceptPick] = useState("");
   const [acceptStake, setAcceptStake] = useState(100);
 
-  // Join private by code
+  // Join private by code UI
   const [showJoinPrivate, setShowJoinPrivate] = useState(false);
   const [joinCode, setJoinCode] = useState("");
 
-  // WebRTC
+  // WebRTC (private only)
   const [videoEnabled, setVideoEnabled] = useState(false);
   const [localStream, setLocalStream] = useState(null);
-  const [iceServers, setIceServers] = useState([{ urls: "stun:stun.l.google.com:19302" }]);
-
   const peersRef = useRef({});
   const remoteVideoRefs = useRef({});
+
   const scrollRef = useRef(null);
 
-  // ---- Catalog ----
+  // ---------- Catalog ----------
   async function loadCatalog() {
     setLoadingCatalog(true);
     try {
@@ -130,31 +131,18 @@ export default function App() {
     }
   }
 
-  // ---- TURN servers (Twilio) ----
-  async function loadTurn() {
-    try {
-      const res = await axios.get(`${BACKEND}/api/turn`);
-      if (res.data?.iceServers?.length) setIceServers(res.data.iceServers);
-    } catch {
-      // keep stun fallback
-    }
-  }
-
   useEffect(() => {
     loadCatalog();
-    loadTurn();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ---- Games ----
+  // ---------- Games ----------
   async function loadGames() {
     setLoadingGames(true);
     setApiError("");
     try {
       const params = { sport, date };
       if (sport === "soccer" && leagueCode) params.leagueCode = leagueCode;
-
-      const res = await axios.get(`${BACKEND}/api/games`, { params });
+      const res = await axios.get(`${BACKEND}/api/games`, { params, timeout: 20000 });
       setGames(res.data.games || []);
     } catch (e) {
       const msg = e?.response?.data?.details || e?.response?.data?.error || e?.message || "Backend/API issue";
@@ -171,7 +159,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, sport, date, leagueCode]);
 
-  // ---- Soccer dropdown data ----
+  // Soccer dropdowns
   const regions = useMemo(() => catalog.map((r) => r.region), [catalog]);
 
   const countries = useMemo(() => {
@@ -185,18 +173,22 @@ export default function App() {
     return c ? c.leagues : [];
   }, [catalog, region, country]);
 
-  // ---- Filtering / ordering ----
+  // Filtered games
   const filteredGames = useMemo(() => {
     const list = games || [];
-
     if (tab === "live") return list.filter((g) => isLive(g.status));
     if (tab === "finished") return list.filter((g) => isFinished(g.status));
 
-    // All Today: live first → finished → upcoming
-    const live = list.filter((g) => isLive(g.status));
-    const finished = list.filter((g) => isFinished(g.status)).sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
-    const upcoming = list.filter((g) => !isLive(g.status) && !isFinished(g.status)).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    return [...live, ...finished, ...upcoming];
+    // All Today: LIVE first, then UPCOMING, then FINISHED
+    const live = list.filter((g) => isLive(g.status)).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    const upcoming = list
+      .filter((g) => !isLive(g.status) && !isFinished(g.status))
+      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    const finished = list
+      .filter((g) => isFinished(g.status))
+      .sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+
+    return [...live, ...upcoming, ...finished];
   }, [games, tab]);
 
   // Clear soccer filters when leaving soccer
@@ -208,7 +200,7 @@ export default function App() {
     }
   }, [sport]);
 
-  // ---- Socket listeners ----
+  // ---------- Socket listeners ----------
   useEffect(() => {
     if (step !== "room") return;
 
@@ -226,7 +218,6 @@ export default function App() {
     };
 
     const onPeerJoined = ({ peerId }) => {
-      // If I'm already sharing video, I initiate to the newcomer
       if (!videoEnabled || !localStream) return;
       createPeer(peerId, true);
     };
@@ -263,7 +254,7 @@ export default function App() {
     };
   }, [step, videoEnabled, localStream]);
 
-  // ---- WebRTC helpers ----
+  // ---------- WebRTC helpers ----------
   function isPrivateRoom(rid) {
     return String(rid || "").startsWith("private:");
   }
@@ -271,7 +262,9 @@ export default function App() {
   function stopVideo() {
     setVideoEnabled(false);
     Object.values(peersRef.current).forEach((p) => {
-      try { p.destroy(); } catch {}
+      try {
+        p.destroy();
+      } catch {}
     });
     peersRef.current = {};
 
@@ -284,12 +277,9 @@ export default function App() {
       initiator,
       trickle: true,
       stream: localStream,
-      config: { iceServers }, // ✅ TURN/STUN here
     });
 
-    peer.on("signal", (data) => {
-      socket.emit("signal", { to: peerId, from: socket.id, data });
-    });
+    peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
 
     peer.on("stream", (stream) => {
       setTimeout(() => {
@@ -312,21 +302,22 @@ export default function App() {
 
   async function startVideo() {
     if (!isPrivateRoom(roomId)) return;
+
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
       setLocalStream(stream);
       setVideoEnabled(true);
 
-      // initiate to everyone already in room
+      // create peers to existing users
       users
-        .filter((u) => u.id && u.username !== username)
+        .filter((u) => u.id && u.username && u.username !== username)
         .forEach((u) => createPeer(u.id, true));
     } catch {
       alert("Could not start camera/mic. Check browser permissions.");
     }
   }
 
-  // ---- Actions ----
+  // ---------- Actions ----------
   function continueFromName() {
     const name = username.trim();
     if (!name) return;
@@ -335,10 +326,12 @@ export default function App() {
   }
 
   function logout() {
-    localStorage.removeItem("wb_username");
     stopVideo();
+    localStorage.removeItem("wb_username");
     setUsername("");
     setStep("enterName");
+    setRoomId("");
+    setSelectedGame(null);
   }
 
   function joinPublic(game) {
@@ -349,6 +342,7 @@ export default function App() {
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     setShowJoinPrivate(false);
     setJoinCode("");
     stopVideo();
@@ -365,6 +359,7 @@ export default function App() {
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     setShowJoinPrivate(false);
     setJoinCode("");
     stopVideo();
@@ -388,6 +383,7 @@ export default function App() {
     setBets([]);
     setMessages([]);
     setBetTarget(null);
+    setApiError("");
     stopVideo();
     socket.emit("joinRoom", { roomId: rid, username, match: selectedGame });
     setStep("room");
@@ -402,7 +398,7 @@ export default function App() {
 
   function openBetToUser(u) {
     setBetTarget(u);
-    setBetTitle(`${selectedGame ? gameTitle(selectedGame) : "Match"} — bet`);
+    setBetTitle(`${selectedGame ? gameTitle(selectedGame) : "Match"} — my pick:`);
     setBetPick("");
     setBetStake(100);
     setAcceptPick("");
@@ -411,7 +407,8 @@ export default function App() {
 
   function createOffer() {
     if (!betTarget) return;
-    if (!betTitle.trim() || !betPick.trim()) return;
+    if (!betTitle.trim()) return;
+    if (!betPick.trim()) return;
     socket.emit("createBetOffer", {
       roomId,
       targetUserId: betTarget.id,
@@ -435,7 +432,7 @@ export default function App() {
     socket.emit("cancelBetOffer", { roomId, betId: b.id });
   }
 
-  // ---- UI ----
+  // ---------- UI ----------
   if (step === "enterName") {
     return (
       <div style={{ padding: 30, fontFamily: "Arial, sans-serif", maxWidth: 520 }}>
@@ -452,19 +449,23 @@ export default function App() {
   if (step === "lobby") {
     return (
       <div style={{ height: "100vh", fontFamily: "Arial, sans-serif", padding: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <h1 style={{ margin: 0 }}>Lobby</h1>
-          <div>
-            Logged in as <b>{username}</b>{" "}
-            <button onClick={logout} style={{ marginLeft: 10 }}>
-              Log out
-            </button>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <div>
+              Logged in as <b>{username}</b>
+            </div>
+            <button onClick={logout}>Logout</button>
           </div>
         </div>
 
         <div style={{ marginTop: 10, display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
           {SPORTS.map((s) => (
-            <button key={s.key} onClick={() => setSport(s.key)} style={{ padding: 10, fontWeight: sport === s.key ? "bold" : "normal" }}>
+            <button
+              key={s.key}
+              onClick={() => setSport(s.key)}
+              style={{ padding: 10, fontWeight: sport === s.key ? "bold" : "normal" }}
+            >
               {s.label}
             </button>
           ))}
@@ -564,7 +565,10 @@ export default function App() {
           <button onClick={() => setTab("live")} style={{ padding: 10, fontWeight: tab === "live" ? "bold" : "normal" }}>
             Live
           </button>
-          <button onClick={() => setTab("finished")} style={{ padding: 10, fontWeight: tab === "finished" ? "bold" : "normal" }}>
+          <button
+            onClick={() => setTab("finished")}
+            style={{ padding: 10, fontWeight: tab === "finished" ? "bold" : "normal" }}
+          >
             Finished
           </button>
         </div>
@@ -575,9 +579,6 @@ export default function App() {
           {apiError ? (
             <div style={{ border: "2px solid #b00", padding: 10, borderRadius: 10, marginBottom: 10 }}>
               <b>Backend/API error:</b> {apiError}
-              <div style={{ fontSize: 12, opacity: 0.8, marginTop: 6 }}>
-                If you see “ESPN status 404”, it’s almost always a wrong leagueCode or wrong backend URL. This code fixes that.
-              </div>
             </div>
           ) : null}
 
@@ -587,7 +588,7 @@ export default function App() {
             {filteredGames.length === 0 ? <div>No games found for this selection.</div> : null}
 
             {filteredGames.map((g) => {
-              const showScore = scoreLine(g);
+              const showScore = !isNotStarted(g.status) && scoreLine(g);
               return (
                 <div key={g.id} style={{ borderBottom: "1px solid #eee", padding: "10px 0" }}>
                   <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
@@ -597,11 +598,12 @@ export default function App() {
                         <div style={{ marginTop: 4 }}>{showScore}</div>
                       ) : (
                         <div style={{ marginTop: 4, opacity: 0.8 }}>
-                          {fmtTime(g.startTime)} • {g.status}
+                          {fmtTime(g.startTime)} {g.status ? `• ${g.status}` : ""}
                         </div>
                       )}
                       <div style={{ marginTop: 4, fontSize: 12, opacity: 0.8 }}>
-                        {g.league ? `${g.league}` : ""} {g.country ? `• ${g.country}` : ""}
+                        {g.league ? `${g.league}` : ""}
+                        {g.country ? ` • ${g.country}` : ""}
                       </div>
                     </div>
                     <div style={{ fontSize: 12, opacity: 0.75, textAlign: "right" }}>{g.status}</div>
@@ -610,16 +612,28 @@ export default function App() {
                   <div style={{ marginTop: 8, display: "flex", gap: 8, flexWrap: "wrap" }}>
                     <button onClick={() => joinPublic(g)}>Join Public (Chat)</button>
                     <button onClick={() => createPrivate(g)}>Create Private (Chat + Bets + Video)</button>
-                    <button onClick={() => openJoinPrivateByCode(g)}>Join Private (Chat + Bets + Video)</button>
+                    <button onClick={() => openJoinPrivateByCode(g)}>Join Private (Code)</button>
                   </div>
 
                   {showJoinPrivate && selectedGame?.id === g.id ? (
                     <div style={{ marginTop: 10, border: "1px solid #aaa", borderRadius: 10, padding: 10, maxWidth: 480 }}>
                       <div style={{ fontWeight: "bold" }}>Enter private code</div>
                       <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-                        <input value={joinCode} onChange={(e) => setJoinCode(e.target.value)} placeholder="Private code" style={{ flex: 1, padding: 10 }} />
+                        <input
+                          value={joinCode}
+                          onChange={(e) => setJoinCode(e.target.value)}
+                          placeholder="Private code"
+                          style={{ flex: 1, padding: 10 }}
+                        />
                         <button onClick={confirmJoinPrivate}>Join</button>
-                        <button onClick={() => { setShowJoinPrivate(false); setJoinCode(""); }}>Cancel</button>
+                        <button
+                          onClick={() => {
+                            setShowJoinPrivate(false);
+                            setJoinCode("");
+                          }}
+                        >
+                          Cancel
+                        </button>
                       </div>
                     </div>
                   ) : null}
@@ -632,7 +646,7 @@ export default function App() {
     );
   }
 
-  // ---- Room ----
+  // ROOM
   const privateRoom = isPrivateRoom(roomId);
 
   return (
@@ -641,9 +655,22 @@ export default function App() {
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
           <div>
             <b>Room:</b> {roomId}
-            {selectedGame ? <> • <b>{gameTitle(selectedGame)}</b></> : null}
+            {selectedGame ? (
+              <>
+                {" "}
+                • <b>{gameTitle(selectedGame)}</b>
+              </>
+            ) : null}
           </div>
-          <button onClick={() => { stopVideo(); setStep("lobby"); setRoomId(""); }}>Back</button>
+          <button
+            onClick={() => {
+              stopVideo();
+              setStep("lobby");
+              setRoomId("");
+            }}
+          >
+            Back
+          </button>
         </div>
 
         {privateRoom ? (
@@ -675,24 +702,24 @@ export default function App() {
                     />
                   </div>
 
-                  {users.filter((u) => u.id && u.username !== username).map((u) => (
-                    <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
-                      <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
-                      <video
-                        autoPlay
-                        playsInline
-                        style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
-                        ref={(el) => {
-                          if (el) remoteVideoRefs.current[u.id] = el;
-                        }}
-                      />
-                    </div>
-                  ))}
+                  {users
+                    .filter((u) => u.id && u.username !== username)
+                    .map((u) => (
+                      <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
+                        <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
+                        <video
+                          autoPlay
+                          playsInline
+                          style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
+                          ref={(el) => {
+                            if (el) remoteVideoRefs.current[u.id] = el;
+                          }}
+                        />
+                      </div>
+                    ))}
                 </>
               ) : (
-                <div style={{ fontSize: 12, opacity: 0.8 }}>
-                  Video is OFF. Click “Start Webcam + Mic” to enable (private rooms only).
-                </div>
+                <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF. Click “Start Webcam + Mic” (private rooms only).</div>
               )}
             </div>
           </div>
@@ -703,7 +730,10 @@ export default function App() {
             <div style={{ fontWeight: "bold" }}>People</div>
             <div style={{ marginTop: 8 }}>
               {users.map((u) => (
-                <div key={u.id} style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #f1f1f1" }}>
+                <div
+                  key={u.id}
+                  style={{ display: "flex", justifyContent: "space-between", padding: "6px 0", borderBottom: "1px solid #f1f1f1" }}
+                >
                   <div>
                     {u.username} {u.username === username ? "(you)" : ""}
                     <div style={{ fontSize: 12, opacity: 0.7 }}>Credits: {u.credits}</div>
@@ -723,11 +753,18 @@ export default function App() {
               <div style={{ fontWeight: "bold" }}>Bet offer to: {betTarget.username}</div>
 
               <input value={betTitle} onChange={(e) => setBetTitle(e.target.value)} style={{ width: "100%", padding: 10, marginTop: 8 }} />
-              <input value={betPick} onChange={(e) => setBetPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10, marginTop: 8 }} />
+              <input
+                value={betPick}
+                onChange={(e) => setBetPick(e.target.value)}
+                placeholder="Your pick"
+                style={{ width: "100%", padding: 10, marginTop: 8 }}
+              />
 
               <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                 <input type="number" value={betStake} onChange={(e) => setBetStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
-                <button onClick={createOffer} style={{ flex: 1 }}>Send offer</button>
+                <button onClick={createOffer} style={{ flex: 1 }}>
+                  Send offer
+                </button>
               </div>
 
               <button onClick={() => setBetTarget(null)} style={{ marginTop: 8, width: "100%", padding: 10 }}>
@@ -747,10 +784,14 @@ export default function App() {
                     <div style={{ fontSize: 12, marginTop: 4 }}>
                       {b.creatorName} → {b.targetName} • stake {b.creatorStake}
                     </div>
-                    <div style={{ fontSize: 12, marginTop: 4 }}>Status: <b>{b.status}</b></div>
+                    <div style={{ fontSize: 12, marginTop: 4 }}>
+                      Status: <b>{b.status}</b>
+                    </div>
 
                     {b.status === "pending" && b.creatorName === username ? (
-                      <button onClick={() => cancelOffer(b)} style={{ marginTop: 6 }}>Cancel</button>
+                      <button onClick={() => cancelOffer(b)} style={{ marginTop: 6 }}>
+                        Cancel
+                      </button>
                     ) : null}
 
                     {b.status === "pending" && b.targetName === username ? (
@@ -758,7 +799,9 @@ export default function App() {
                         <input value={acceptPick} onChange={(e) => setAcceptPick(e.target.value)} placeholder="Your pick" style={{ width: "100%", padding: 10 }} />
                         <div style={{ display: "flex", gap: 8, marginTop: 6 }}>
                           <input type="number" value={acceptStake} onChange={(e) => setAcceptStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
-                          <button onClick={() => acceptOffer(b)} style={{ flex: 1 }}>Accept</button>
+                          <button onClick={() => acceptOffer(b)} style={{ flex: 1 }}>
+                            Accept
+                          </button>
                         </div>
                       </div>
                     ) : null}
@@ -783,7 +826,9 @@ export default function App() {
             onChange={(e) => setText(e.target.value)}
             placeholder="Type message"
             style={{ flex: 1, padding: 10 }}
-            onKeyDown={(e) => { if (e.key === "Enter") sendMessage(); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") sendMessage();
+            }}
           />
           <button onClick={sendMessage}>Send</button>
         </div>
