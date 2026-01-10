@@ -27,18 +27,14 @@ function parseAllowedOrigins() {
   list.push("http://127.0.0.1:3001");
   return Array.from(new Set(list));
 }
-const allowedOrigins = parseAllowedOrigins();
 
-function isAllowedOrigin(origin) {
-  if (!origin) return true;
-  if (allowedOrigins.includes(origin)) return true;
-  return false;
-}
+const allowedOrigins = parseAllowedOrigins();
 
 app.use(
   cors({
     origin: function (origin, cb) {
-      if (isAllowedOrigin(origin)) return cb(null, true);
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
       return cb(new Error(`CORS blocked origin: ${origin}`));
     },
     credentials: true,
@@ -50,7 +46,8 @@ const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
     origin: function (origin, cb) {
-      if (isAllowedOrigin(origin)) return cb(null, true);
+      if (!origin) return cb(null, true);
+      if (allowedOrigins.includes(origin)) return cb(null, true);
       return cb(new Error(`Socket CORS blocked origin: ${origin}`));
     },
     credentials: true,
@@ -75,11 +72,13 @@ function normalizeStatus(detail, state) {
   const d = String(detail || "").toUpperCase();
   const s = String(state || "").toUpperCase();
 
+  // Soccer
   if (d.includes("FULL") || d === "FT" || d.includes("FINAL")) return "FT";
   if (d.includes("HALF") || d === "HT") return "HT";
   if (d.includes("AET")) return "AET";
   if (d.includes("PENS")) return "PENS";
 
+  // Other sports
   if (d.includes("HALF")) return "HALFTIME";
   if (d.includes("FINAL")) return "FINAL";
   if (s === "IN") return "LIVE";
@@ -367,7 +366,6 @@ function getOrCreateRoom(roomId) {
 function emitRoom(roomId) {
   const st = roomState.get(roomId);
   if (!st) return;
-
   io.to(roomId).emit("room-state", {
     users: st.users,
     bets: st.bets,
@@ -375,22 +373,6 @@ function emitRoom(roomId) {
     videoAllowed: st.videoAllowed,
     videoReadyIds: Array.from(st.videoReady),
   });
-}
-
-function removeFromRoom(roomId, socketId) {
-  const st = roomState.get(roomId);
-  if (!st) return false;
-
-  const before = st.users.length;
-  st.users = st.users.filter((u) => u.id !== socketId);
-  st.videoReady.delete(socketId);
-
-  if (st.users.length !== before) {
-    emitRoom(roomId);
-    if (st.users.length === 0) roomState.delete(roomId);
-    return true;
-  }
-  return false;
 }
 
 io.on("connection", (socket) => {
@@ -401,29 +383,15 @@ io.on("connection", (socket) => {
     const st = getOrCreateRoom(roomId);
     st.match = match || st.match;
 
-    // Preserve credits if same username already exists in room
-    const existing = st.users.find((u) => u.username === username);
-    const credits = existing?.credits ?? 1000;
-
     st.users = st.users.filter((u) => u.id !== socket.id);
-    st.users.push({ id: socket.id, username, credits });
+    st.users.push({ id: socket.id, username, credits: 1000 });
 
     io.to(roomId).emit("message", { user: "System", text: `${username} joined` });
 
-    // "peer-joined" is still useful for UI, but NOT for starting video
+    // Tell others someone joined (so they can optionally connect if already video-ready)
     socket.to(roomId).emit("peer-joined", { peerId: socket.id });
 
     emitRoom(roomId);
-  });
-
-  socket.on("leaveRoom", ({ roomId }) => {
-    if (!roomId) return;
-    socket.leave(roomId);
-    const removed = removeFromRoom(roomId, socket.id);
-    if (removed) {
-      socket.to(roomId).emit("peer-left", { peerId: socket.id });
-      io.to(roomId).emit("message", { user: "System", text: `Someone left` });
-    }
   });
 
   socket.on("chatMessage", ({ roomId, user, text }) => {
@@ -431,19 +399,16 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("message", { user, text });
   });
 
-  // ✅ WebRTC signaling pass-through (server decides "from")
-  socket.on("signal", ({ to, data }) => {
+  // ✅ WebRTC signaling pass-through
+  socket.on("signal", ({ to, from, data }) => {
     if (!to || !data) return;
-    io.to(to).emit("signal", { from: socket.id, data });
+    io.to(to).emit("signal", { from, data });
   });
 
   // ✅ When someone clicks "Start Webcam", tell others
   socket.on("video-ready", ({ roomId }) => {
     const st = roomState.get(roomId);
     if (!st) return;
-
-    if (!st.videoAllowed) return;
-
     st.videoReady.add(socket.id);
     socket.to(roomId).emit("video-ready", { peerId: socket.id });
     emitRoom(roomId);
@@ -471,6 +436,7 @@ io.on("connection", (socket) => {
       creatorStake: Number(stake || 0),
       targetStake: Number(stake || 0),
       creatorPick: String(pick || ""),
+      targetPick: "",
       winnerName: "",
     });
 
