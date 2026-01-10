@@ -13,7 +13,7 @@ try {
     twilioClient = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
   }
 } catch {
-  // twilio not installed - ICE endpoint will fall back to STUN only
+  // ok
 }
 
 const app = express();
@@ -27,7 +27,6 @@ function parseAllowedOrigins() {
   list.push("http://127.0.0.1:3001");
   return Array.from(new Set(list));
 }
-
 const allowedOrigins = parseAllowedOrigins();
 
 app.use(
@@ -72,13 +71,11 @@ function normalizeStatus(detail, state) {
   const d = String(detail || "").toUpperCase();
   const s = String(state || "").toUpperCase();
 
-  // Soccer
   if (d.includes("FULL") || d === "FT" || d.includes("FINAL")) return "FT";
   if (d.includes("HALF") || d === "HT") return "HT";
   if (d.includes("AET")) return "AET";
   if (d.includes("PENS")) return "PENS";
 
-  // Other sports
   if (d.includes("HALF")) return "HALFTIME";
   if (d.includes("FINAL")) return "FINAL";
   if (s === "IN") return "LIVE";
@@ -203,8 +200,8 @@ async function fetchScoreboardNonSoccer({ sportPath, label, country, isoDate, sp
 
   const url = `${ESPN_BASE}/sports/${sportPath}/scoreboard?dates=${dates}`;
   const { data } = await axios.get(url, { timeout: 20000 });
-
   const events = data?.events || [];
+
   return events.map((event) =>
     mapEspnEventToGame({
       event,
@@ -222,8 +219,8 @@ async function fetchSoccerLeague({ leagueCode, leagueLabel, country, isoDate }) 
 
   const url = `${ESPN_BASE}/sports/soccer/${encodeURIComponent(leagueCode)}/scoreboard?dates=${dates}`;
   const { data } = await axios.get(url, { timeout: 20000 });
-
   const events = data?.events || [];
+
   return events.map((event) =>
     mapEspnEventToGame({
       event,
@@ -235,6 +232,11 @@ async function fetchSoccerLeague({ leagueCode, leagueLabel, country, isoDate }) 
   );
 }
 
+function isGameFinished(status) {
+  const s = String(status || "").toUpperCase();
+  return s === "FT" || s.includes("FINAL") || s.includes("CLOSED");
+}
+
 // -------------------- Routes --------------------
 app.get("/", (req, res) => res.send("Backend is running 🚀"));
 
@@ -242,15 +244,12 @@ app.get("/api/health", (req, res) => {
   res.json({ ok: true, allowedOrigins, hasTwilio: Boolean(twilioClient) });
 });
 
-// ✅ ICE servers for WebRTC (TURN)
 app.get("/api/ice", async (req, res) => {
   try {
     if (twilioClient) {
       const token = await twilioClient.tokens.create();
       return res.json({ iceServers: token.iceServers || [] });
     }
-
-    // Fallback STUN only
     return res.json({
       iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:global.stun.twilio.com:3478" }],
     });
@@ -329,15 +328,8 @@ app.get("/api/games", async (req, res) => {
       sportKey: sport,
     });
 
-    const cleaned = games.map((g) => {
-      const st = String(g.status || "").toUpperCase();
-      const notStarted = st.includes("SCHEDULED") || st.includes("PRE") || st.includes("AM") || st.includes("PM");
-      if (notStarted) return { ...g, homeScore: null, awayScore: null };
-      return g;
-    });
-
-    cleaned.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    return res.json({ games: cleaned });
+    games.sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    return res.json({ games });
   } catch (err) {
     const status = err?.response?.status;
     return res.status(500).json({
@@ -347,8 +339,20 @@ app.get("/api/games", async (req, res) => {
   }
 });
 
-// -------------------- Rooms / chat / bets / WebRTC signaling --------------------
+// -------------------- Rooms / chat / bets / WebRTC --------------------
+// IMPORTANT: identity is USERNAME (stable), not socket id (changes on reconnect)
+
 const roomState = new Map();
+/**
+ * roomState[roomId] = {
+ *   users: [{ username, socketId, credits, online }],
+ *   bets: [ ... ],
+ *   match: {id, sport, leagueCode, startTime, ...},
+ *   videoAllowed: bool,
+ *   videoReady: Set<username>
+ * }
+ */
+
 function getOrCreateRoom(roomId) {
   if (!roomState.has(roomId)) {
     roomState.set(roomId, {
@@ -356,7 +360,7 @@ function getOrCreateRoom(roomId) {
       bets: [],
       match: null,
       videoAllowed: String(roomId || "").startsWith("private:"),
-      videoReady: new Set(), // socket ids that clicked "Start Webcam"
+      videoReady: new Set(),
     });
   }
   return roomState.get(roomId);
@@ -365,60 +369,192 @@ function getOrCreateRoom(roomId) {
 function emitRoom(roomId) {
   const st = roomState.get(roomId);
   if (!st) return;
+
   io.to(roomId).emit("room-state", {
-    users: st.users,
+    users: st.users.map((u) => ({ username: u.username, credits: u.credits, online: u.online })),
     bets: st.bets,
     match: st.match,
     videoAllowed: st.videoAllowed,
-    videoReadyIds: Array.from(st.videoReady),
+    videoReadyUsers: Array.from(st.videoReady),
   });
 }
 
+function findUserByName(st, username) {
+  const name = String(username || "").trim();
+  return st.users.find((u) => u.username === name) || null;
+}
+
+function getSocketIdByUsername(st, username) {
+  const u = findUserByName(st, username);
+  return u?.socketId || null;
+}
+
+function betPickWinner(game) {
+  if (!game) return null;
+  const hs = safeNum(game.homeScore);
+  const as = safeNum(game.awayScore);
+  if (hs === null || as === null) return null;
+  if (as > hs) return `${game.away} win`;
+  if (hs > as) return `${game.home} win`;
+  return "draw";
+}
+
+async function fetchGameForMatch(match) {
+  if (!match?.id || !match?.sport) return null;
+
+  // derive date
+  const d = String(match.startTime || "").slice(0, 10); // YYYY-MM-DD
+  const date = d && d.includes("-") ? d : null;
+  if (!date) return null;
+
+  if (match.sport === "soccer") {
+    const code = match.leagueCode || "";
+    if (!code) return null;
+    const games = await fetchSoccerLeague({
+      leagueCode: code,
+      leagueLabel: match.league || code,
+      country: match.country || "",
+      isoDate: date,
+    });
+    return games.find((g) => String(g.id) === String(match.id)) || null;
+  }
+
+  const map = {
+    nba: { sportPath: "basketball/nba", label: "NBA", country: "United States" },
+    nfl: { sportPath: "football/nfl", label: "NFL", country: "United States" },
+    nhl: { sportPath: "hockey/nhl", label: "NHL", country: "United States/Canada" },
+    mlb: { sportPath: "baseball/mlb", label: "MLB", country: "United States" },
+  };
+
+  const meta = map[match.sport];
+  if (!meta) return null;
+
+  const games = await fetchScoreboardNonSoccer({
+    sportPath: meta.sportPath,
+    label: meta.label,
+    country: meta.country,
+    isoDate: date,
+    sportKey: match.sport,
+  });
+
+  return games.find((g) => String(g.id) === String(match.id)) || null;
+}
+
+// Auto-settle loop: checks active bets and settles after game finished
+setInterval(async () => {
+  try {
+    for (const [roomId, st] of roomState.entries()) {
+      const hasActive = st.bets.some((b) => b.status === "active");
+      if (!hasActive) continue;
+      if (!st.match) continue;
+
+      const g = await fetchGameForMatch(st.match);
+      if (!g) continue;
+
+      if (!isGameFinished(g.status)) continue;
+
+      const winnerPick = betPickWinner(g); // "Team win" or "draw"
+      if (!winnerPick) continue;
+
+      let changed = false;
+      for (const bet of st.bets) {
+        if (bet.status !== "active") continue;
+
+        const creatorCorrect = bet.creatorPick === winnerPick;
+        const targetCorrect = bet.targetPick === winnerPick;
+
+        let winnerName = "No winner";
+        if (creatorCorrect && !targetCorrect) winnerName = bet.creatorName;
+        if (targetCorrect && !creatorCorrect) winnerName = bet.targetName;
+        if (creatorCorrect && targetCorrect) winnerName = "Both right";
+        if (!creatorCorrect && !targetCorrect) winnerName = "Both wrong";
+
+        bet.status = "settled";
+        bet.winnerName = winnerName;
+        bet.final = { status: g.status, score: { home: g.homeScore, away: g.awayScore }, winnerPick };
+        changed = true;
+      }
+
+      if (changed) emitRoom(roomId);
+    }
+  } catch {
+    // ignore
+  }
+}, 15000);
+
 io.on("connection", (socket) => {
   socket.on("joinRoom", ({ roomId, username, match }) => {
-    if (!roomId || !username) return;
-    socket.join(roomId);
+    const rid = String(roomId || "").trim();
+    const name = String(username || "").trim();
+    if (!rid || !name) return;
 
-    const st = getOrCreateRoom(roomId);
+    socket.join(rid);
+
+    const st = getOrCreateRoom(rid);
     st.match = match || st.match;
 
-    st.users = st.users.filter((u) => u.id !== socket.id);
-    st.users.push({ id: socket.id, username, credits: 1000 });
+    // Upsert user by username (reconnect safe)
+    let u = findUserByName(st, name);
+    if (!u) {
+      u = { username: name, socketId: socket.id, credits: 1000, online: true };
+      st.users.push(u);
+    } else {
+      u.socketId = socket.id;
+      u.online = true;
+    }
 
-    io.to(roomId).emit("message", { user: "System", text: `${username} joined` });
-    socket.to(roomId).emit("peer-joined", { peerId: socket.id });
+    io.to(rid).emit("message", { user: "System", text: `${name} joined` });
+    socket.to(rid).emit("peer-joined", { username: name });
 
-    emitRoom(roomId);
+    emitRoom(rid);
   });
 
   socket.on("chatMessage", ({ roomId, user, text }) => {
-    if (!roomId || !text) return;
-    io.to(roomId).emit("message", { user, text });
+    const rid = String(roomId || "").trim();
+    if (!rid || !text) return;
+    io.to(rid).emit("message", { user, text });
   });
 
-  // ✅ WebRTC signaling pass-through
-  socket.on("signal", ({ to, from, data }) => {
-    if (!to || !data) return;
-    io.to(to).emit("signal", { from, data });
-  });
+  // WebRTC signaling uses usernames (stable)
+  socket.on("signal", ({ roomId, toUsername, fromUsername, data }) => {
+    const rid = String(roomId || "").trim();
+    if (!rid || !toUsername || !data) return;
 
-  // ✅ When someone clicks "Start Webcam", tell others to connect to them
-  socket.on("video-ready", ({ roomId }) => {
-    const st = roomState.get(roomId);
+    const st = roomState.get(rid);
     if (!st) return;
-    st.videoReady.add(socket.id);
-    socket.to(roomId).emit("video-ready", { peerId: socket.id });
-    emitRoom(roomId);
+
+    const toSocketId = getSocketIdByUsername(st, String(toUsername).trim());
+    if (!toSocketId) return;
+
+    io.to(toSocketId).emit("signal", { fromUsername: String(fromUsername || ""), data });
+  });
+
+  socket.on("video-ready", ({ roomId, username }) => {
+    const rid = String(roomId || "").trim();
+    const name = String(username || "").trim();
+    if (!rid || !name) return;
+
+    const st = roomState.get(rid);
+    if (!st) return;
+
+    st.videoReady.add(name);
+    socket.to(rid).emit("video-ready", { username: name });
+    emitRoom(rid);
   });
 
   // Bets
-  socket.on("createBetOffer", ({ roomId, targetUserId, title, stake, pick }) => {
-    const st = roomState.get(roomId);
+  socket.on("createBetOffer", ({ roomId, targetUsername, title, stake, pick, creatorUsername }) => {
+    const rid = String(roomId || "").trim();
+    const st = roomState.get(rid);
     if (!st) return;
 
-    const me = st.users.find((u) => u.id === socket.id);
-    const target = st.users.find((u) => u.id === targetUserId);
-    if (!me || !target) return;
+    const creatorName = String(creatorUsername || "").trim();
+    const targetName = String(targetUsername || "").trim();
+    if (!creatorName || !targetName) return;
+
+    const creator = findUserByName(st, creatorName);
+    const target = findUserByName(st, targetName);
+    if (!creator || !target) return;
 
     const betId = `bet_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 
@@ -426,61 +562,98 @@ io.on("connection", (socket) => {
       id: betId,
       status: "pending",
       title: String(title || "Bet"),
-      creatorId: me.id,
-      creatorName: me.username,
-      targetId: target.id,
-      targetName: target.username,
+      creatorName,
+      targetName,
       creatorStake: Number(stake || 0),
       targetStake: Number(stake || 0),
       creatorPick: String(pick || ""),
+      targetPick: "",
       winnerName: "",
+      cancel: { creator: false, target: false }, // both must confirm cancel
+      createdAt: Date.now(),
     });
 
-    emitRoom(roomId);
-    io.to(roomId).emit("message", { user: "System", text: `${me.username} offered a bet to ${target.username}` });
+    emitRoom(rid);
+    io.to(rid).emit("message", { user: "System", text: `${creatorName} offered a bet to ${targetName}` });
   });
 
-  socket.on("acceptBetOffer", ({ roomId, betId, targetPick, targetStake }) => {
-    const st = roomState.get(roomId);
+  socket.on("acceptBetOffer", ({ roomId, betId, targetPick, targetStake, username }) => {
+    const rid = String(roomId || "").trim();
+    const st = roomState.get(rid);
     if (!st) return;
 
+    const name = String(username || "").trim();
     const bet = st.bets.find((b) => b.id === betId);
     if (!bet || bet.status !== "pending") return;
-    if (socket.id !== bet.targetId) return;
+    if (bet.targetName !== name) return;
 
     bet.status = "active";
-    bet.targetPick = String(targetPick || "ACCEPT");
+    bet.targetPick = String(targetPick || "");
     bet.targetStake = Number(targetStake || bet.targetStake);
 
-    emitRoom(roomId);
-    io.to(roomId).emit("message", { user: "System", text: `${bet.targetName} accepted the bet!` });
+    emitRoom(rid);
+    io.to(rid).emit("message", { user: "System", text: `${bet.targetName} accepted the bet!` });
   });
 
-  socket.on("cancelBetOffer", ({ roomId, betId }) => {
-    const st = roomState.get(roomId);
+  // Cancel requires BOTH confirmations
+  socket.on("requestCancelBet", ({ roomId, betId, username }) => {
+    const rid = String(roomId || "").trim();
+    const st = roomState.get(rid);
     if (!st) return;
-    const bet = st.bets.find((b) => b.id === betId);
-    if (!bet || bet.status !== "pending") return;
-    if (socket.id !== bet.creatorId) return;
 
-    bet.status = "cancelled";
-    emitRoom(roomId);
+    const name = String(username || "").trim();
+    const bet = st.bets.find((b) => b.id === betId);
+    if (!bet) return;
+
+    // only creator/target can request cancel
+    if (name !== bet.creatorName && name !== bet.targetName) return;
+
+    // if already settled/cancelled, ignore
+    if (bet.status === "settled" || bet.status === "cancelled") return;
+
+    // mark who agreed
+    if (name === bet.creatorName) bet.cancel.creator = true;
+    if (name === bet.targetName) bet.cancel.target = true;
+
+    // if both agreed -> cancel
+    if (bet.cancel.creator && bet.cancel.target) {
+      bet.status = "cancelled";
+      emitRoom(rid);
+      io.to(rid).emit("message", { user: "System", text: `Bet cancelled by mutual agreement.` });
+      return;
+    }
+
+    // otherwise mark as cancel-pending
+    bet.status = "cancel_pending";
+    emitRoom(rid);
+    io.to(rid).emit("message", { user: "System", text: `${name} requested to cancel the bet (waiting for other person).` });
   });
 
   socket.on("disconnect", () => {
-    for (const [roomId, st] of roomState.entries()) {
-      const before = st.users.length;
+    // mark users offline (do NOT delete bets)
+    for (const [rid, st] of roomState.entries()) {
+      let changed = false;
 
-      st.users = st.users.filter((u) => u.id !== socket.id);
-      st.videoReady.delete(socket.id);
-
-      if (st.users.length !== before) {
-        socket.to(roomId).emit("peer-left", { peerId: socket.id });
-        io.to(roomId).emit("message", { user: "System", text: `Someone left` });
-        emitRoom(roomId);
+      for (const u of st.users) {
+        if (u.socketId === socket.id) {
+          u.socketId = null;
+          u.online = false;
+          st.videoReady.delete(u.username);
+          changed = true;
+        }
       }
 
-      if (st.users.length === 0) roomState.delete(roomId);
+      if (changed) {
+        socket.to(rid).emit("peer-left", { socketId: socket.id });
+        emitRoom(rid);
+      }
+
+      // optional: cleanup empty rooms with no online users AND no active/pending bets
+      const anyOnline = st.users.some((u) => u.online);
+      const hasImportantBets = st.bets.some((b) => b.status === "pending" || b.status === "active" || b.status === "cancel_pending");
+      if (!anyOnline && !hasImportantBets) {
+        roomState.delete(rid);
+      }
     }
   });
 });
