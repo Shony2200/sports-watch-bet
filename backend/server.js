@@ -387,8 +387,6 @@ io.on("connection", (socket) => {
     st.users.push({ id: socket.id, username, credits: 1000 });
 
     io.to(roomId).emit("message", { user: "System", text: `${username} joined` });
-
-    // Tell others someone joined (so they can optionally connect if already video-ready)
     socket.to(roomId).emit("peer-joined", { peerId: socket.id });
 
     emitRoom(roomId);
@@ -399,13 +397,11 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("message", { user, text });
   });
 
-  // ✅ WebRTC signaling pass-through
   socket.on("signal", ({ to, from, data }) => {
     if (!to || !data) return;
     io.to(to).emit("signal", { from, data });
   });
 
-  // ✅ When someone clicks "Start Webcam", tell others
   socket.on("video-ready", ({ roomId }) => {
     const st = roomState.get(roomId);
     if (!st) return;
@@ -453,7 +449,7 @@ io.on("connection", (socket) => {
     if (socket.id !== bet.targetId) return;
 
     bet.status = "active";
-    bet.targetPick = String(targetPick || "ACCEPT");
+    bet.targetPick = String(targetPick || "");
     bet.targetStake = Number(targetStake || bet.targetStake);
 
     emitRoom(roomId);

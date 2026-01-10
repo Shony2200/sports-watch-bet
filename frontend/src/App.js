@@ -82,7 +82,7 @@ export default function App() {
   const [roomId, setRoomId] = useState("");
   const [selectedGame, setSelectedGame] = useState(null);
   const [users, setUsers] = useState([]);
-  const [videoReadyIds, setVideoReadyIds] = useState([]); // ✅ from server room-state
+  const [videoReadyIds, setVideoReadyIds] = useState([]);
   const [bets, setBets] = useState([]);
   const [messages, setMessages] = useState([]);
 
@@ -105,13 +105,11 @@ export default function App() {
   const peersRef = useRef({});
   const remoteVideoRefs = useRef({});
   const pendingSignalsRef = useRef({}); // peerId -> [signalData]
-
   const [mySocketId, setMySocketId] = useState("");
 
   const scrollRef = useRef(null);
 
   useEffect(() => {
-    // ensure we always know our socket id (used for filtering + initiator rule)
     const setId = () => setMySocketId(socket.id || "");
     setId();
     socket.on("connect", setId);
@@ -122,7 +120,7 @@ export default function App() {
     return String(rid || "").startsWith("private:");
   }
 
-  // ✅ Deterministic initiator to avoid "glare" (both initiator=true)
+  // ✅ Deterministic initiator to avoid glare
   function shouldInitiate(peerId) {
     if (!mySocketId || !peerId) return false;
     return String(mySocketId) < String(peerId);
@@ -236,12 +234,10 @@ export default function App() {
     };
 
     const onPeerJoined = ({ peerId }) => {
-      // If I'm already video-ready, only connect if the initiator rule says I should
       if (videoEnabled && localStream) createPeer(peerId);
     };
 
     const onVideoReady = ({ peerId }) => {
-      // Someone clicked Start Webcam. If I'm ready too, connect.
       if (videoEnabled && localStream) createPeer(peerId);
     };
 
@@ -253,7 +249,6 @@ export default function App() {
       setVideoEnabled((v) => v);
     };
 
-    // ✅ Buffer signals if webcam not started yet
     const onSignal = ({ from, data }) => {
       if (!from || !data) return;
 
@@ -313,21 +308,30 @@ export default function App() {
       initiator,
       trickle: true,
       stream: localStream,
-      config: { iceServers: iceServers && iceServers.length ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }] },
+      config: {
+        iceServers: iceServers && iceServers.length ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }],
+      },
     });
 
     peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
 
-    peer.on("stream", (stream) => {
-      // Mobile Safari sometimes needs explicit play()
+    const attachToRemote = (stream) => {
       setTimeout(() => {
         const el = remoteVideoRefs.current[peerId];
-        if (el) {
-          el.srcObject = stream;
-          const p = el.play?.();
-          if (p && typeof p.catch === "function") p.catch(() => {});
-        }
+        if (!el) return;
+        el.srcObject = stream;
+
+        // force play (desktop safari/chrome sometimes blocks unless muted)
+        const p = el.play?.();
+        if (p && typeof p.catch === "function") p.catch(() => {});
       }, 0);
+    };
+
+    peer.on("stream", attachToRemote);
+
+    // ✅ Safari/iOS sometimes uses track
+    peer.on("track", (track, stream) => {
+      if (stream) attachToRemote(stream);
     });
 
     peer.on("close", () => {
@@ -339,7 +343,6 @@ export default function App() {
 
     peersRef.current[peerId] = peer;
 
-    // Apply pending signals
     const pending = pendingSignalsRef.current[peerId];
     if (pending && pending.length) {
       pending.forEach((sig) => {
@@ -363,10 +366,9 @@ export default function App() {
       setLocalStream(stream);
       setVideoEnabled(true);
 
-      // Tell others I'm ready
       socket.emit("video-ready", { roomId });
 
-      // ✅ Only connect to users who have already clicked "Start Webcam"
+      // ✅ only connect to already video-ready peers
       const ready = new Set(videoReadyIds || []);
       (users || [])
         .filter((u) => u?.id && u.id !== mySocketId && ready.has(u.id))
@@ -454,8 +456,8 @@ export default function App() {
     setText("");
   }
 
-  // ✅ Bet pick helpers (click-to-choose)
-  const offerPickOptions = useMemo(() => {
+  // ✅ Bet pick options (buttons)
+  const pickOptions = useMemo(() => {
     if (!selectedGame) return [];
     return [
       { label: selectedGame.away, value: `${selectedGame.away} win` },
@@ -753,19 +755,26 @@ export default function App() {
                     />
                   </div>
 
-                  {/* ✅ Render ALL OTHER sockets, not "different username" */}
+                  {/* ✅ Remote tiles: show anyone whose socket id is not mine */}
                   {users
                     .filter((u) => u.id && u.id !== mySocketId)
                     .map((u) => (
                       <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
                         <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
+
+                        {/* ✅ MUTED = autoplay allowed. Click video to unmute. */}
                         <video
                           autoPlay
                           playsInline
-                          // remote must NOT be muted, or you won’t hear them
+                          muted
                           style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
                           ref={(el) => {
                             if (el) remoteVideoRefs.current[u.id] = el;
+                          }}
+                          onClick={(e) => {
+                            e.currentTarget.muted = false;
+                            const p = e.currentTarget.play?.();
+                            if (p && typeof p.catch === "function") p.catch(() => {});
                           }}
                         />
                       </div>
@@ -774,6 +783,10 @@ export default function App() {
               ) : (
                 <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF. Click “Start Webcam + Mic”.</div>
               )}
+            </div>
+
+            <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
+              Tip: remote videos start muted (to avoid autoplay blocking). Click a video to unmute.
             </div>
           </div>
         ) : null}
@@ -789,7 +802,7 @@ export default function App() {
                     <div style={{ fontSize: 12, opacity: 0.7 }}>Credits: {u.credits}</div>
                   </div>
                   {u.id !== mySocketId ? (
-                    <button onClick={() => openBetToUser(u)} style={{ height: 34 }}>
+                    <button onClick={() => { setBetTarget(u); setBetTitle(`${selectedGame ? gameTitle(selectedGame) : "Match"} — my pick:`); setBetPick(""); setBetStake(100); setAcceptPick(""); setAcceptStake(100); }} style={{ height: 34 }}>
                       Offer Bet
                     </button>
                   ) : null}
@@ -801,13 +814,11 @@ export default function App() {
           {betTarget ? (
             <div style={{ width: 360, border: "2px solid #111", borderRadius: 10, padding: 10 }}>
               <div style={{ fontWeight: "bold" }}>Bet offer to: {betTarget.username}</div>
-
               <input value={betTitle} onChange={(e) => setBetTitle(e.target.value)} style={{ width: "100%", padding: 10, marginTop: 8 }} />
 
-              {/* ✅ Click-to-choose pick */}
               <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>Your pick (click one):</div>
               <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-                {offerPickOptions.map((opt) => (
+                {pickOptions.map((opt) => (
                   <button
                     key={opt.value}
                     onClick={() => setBetPick(opt.value)}
@@ -866,7 +877,7 @@ export default function App() {
                       <div style={{ marginTop: 8 }}>
                         <div style={{ fontSize: 12, opacity: 0.75 }}>Your pick (click one):</div>
                         <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap" }}>
-                          {offerPickOptions.map((opt) => (
+                          {pickOptions.map((opt) => (
                             <button
                               key={opt.value}
                               onClick={() => setAcceptPick(opt.value)}
