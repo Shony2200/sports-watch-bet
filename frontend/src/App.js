@@ -37,12 +37,10 @@ function isLive(status) {
   const s = String(status || "").toUpperCase();
   return s.includes("LIVE") || s.includes("IN PROGRESS") || s.includes("Q") || s.includes("PERIOD") || s.includes("HALF");
 }
-
 function isFinished(status) {
   const s = String(status || "").toUpperCase();
   return s === "FT" || s.includes("FINAL") || s.includes("CLOSED");
 }
-
 function isNotStarted(status) {
   const s = String(status || "").toUpperCase();
   return s.includes("SCHEDULED") || s.includes("PRE") || s.includes("AM") || s.includes("PM");
@@ -62,7 +60,6 @@ function scoreLine(g) {
 }
 
 function isoDateFromStartTime(startTime) {
-  // ESPN gives ISO like 2026-01-10T...Z
   const s = String(startTime || "");
   if (s.length >= 10 && s[4] === "-" && s[7] === "-") return s.slice(0, 10);
   return todayISO();
@@ -70,7 +67,7 @@ function isoDateFromStartTime(startTime) {
 
 export default function App() {
   const [username, setUsername] = useState(localStorage.getItem("wb_username") || "");
-  const [step, setStep] = useState(username ? "lobby" : "enterName"); // enterName | lobby | room
+  const [step, setStep] = useState(username ? "lobby" : "enterName");
 
   const [sport, setSport] = useState("soccer");
   const [date, setDate] = useState(todayISO());
@@ -89,7 +86,6 @@ export default function App() {
   const [roomId, setRoomId] = useState("");
   const [selectedGame, setSelectedGame] = useState(null);
 
-  // ✅ Live score shown in the room
   const [roomGameLive, setRoomGameLive] = useState(null);
   const [roomGameError, setRoomGameError] = useState("");
 
@@ -97,7 +93,6 @@ export default function App() {
   const [videoReadyIds, setVideoReadyIds] = useState([]);
   const [bets, setBets] = useState([]);
   const [messages, setMessages] = useState([]);
-
   const [text, setText] = useState("");
 
   const [betTarget, setBetTarget] = useState(null);
@@ -115,9 +110,9 @@ export default function App() {
   const [localStream, setLocalStream] = useState(null);
   const [iceServers, setIceServers] = useState([]);
   const peersRef = useRef({});
-  const remoteVideoRefs = useRef({});   // peerId -> HTMLVideoElement
-  const remoteStreamsRef = useRef({});  // ✅ peerId -> MediaStream (fixes "stream arrives before video exists")
-  const pendingSignalsRef = useRef({}); // peerId -> [signalData]
+  const remoteVideoRefs = useRef({});   // peerId -> video element
+  const remoteStreamsRef = useRef({});  // peerId -> MediaStream
+  const pendingSignalsRef = useRef({}); // peerId -> [signal]
   const [mySocketId, setMySocketId] = useState("");
 
   const scrollRef = useRef(null);
@@ -133,7 +128,7 @@ export default function App() {
     return String(rid || "").startsWith("private:");
   }
 
-  // ✅ deterministic initiator (prevents double-offer glare issues)
+  // Deterministic initiator
   function shouldInitiate(peerId) {
     if (!mySocketId || !peerId) return false;
     return String(mySocketId) < String(peerId);
@@ -148,7 +143,6 @@ export default function App() {
     }
   }
 
-  // Catalog
   async function loadCatalog() {
     setLoadingCatalog(true);
     try {
@@ -166,14 +160,12 @@ export default function App() {
     loadIceServers();
   }, []);
 
-  // Games
   async function loadGames() {
     setLoadingGames(true);
     setApiError("");
     try {
       const params = { sport, date };
       if (sport === "soccer" && leagueCode) params.leagueCode = leagueCode;
-
       const res = await axios.get(`${BACKEND}/api/games`, { params, timeout: 25000 });
       setGames(res.data.games || []);
     } catch (e) {
@@ -191,7 +183,7 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, sport, date, leagueCode]);
 
-  // ✅ Live score polling when in room (public or private)
+  // Room live score polling
   useEffect(() => {
     if (step !== "room" || !selectedGame?.id || !selectedGame?.sport) return;
 
@@ -240,12 +232,8 @@ export default function App() {
     if (tab === "finished") return list.filter((g) => isFinished(g.status));
 
     const live = list.filter((g) => isLive(g.status)).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    const upcoming = list
-      .filter((g) => !isLive(g.status) && !isFinished(g.status))
-      .sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
-    const finished = list
-      .filter((g) => isFinished(g.status))
-      .sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
+    const upcoming = list.filter((g) => !isLive(g.status) && !isFinished(g.status)).sort((a, b) => new Date(a.startTime) - new Date(b.startTime));
+    const finished = list.filter((g) => isFinished(g.status)).sort((a, b) => new Date(b.startTime) - new Date(a.startTime));
 
     return [...live, ...upcoming, ...finished];
   }, [games, tab]);
@@ -258,7 +246,7 @@ export default function App() {
     }
   }, [sport]);
 
-  // ✅ Attach stream to video safely (works even if video mounts later)
+  // Attach remote stream when video element exists
   function attachStreamToVideo(peerId) {
     const el = remoteVideoRefs.current[peerId];
     const stream = remoteStreamsRef.current[peerId];
@@ -280,12 +268,12 @@ export default function App() {
       tries += 1;
       const ok = attachStreamToVideo(peerId);
       if (ok) return;
-      if (tries < 20) setTimeout(tick, 250); // retry up to ~5 seconds
+      if (tries < 20) setTimeout(tick, 250);
     };
     tick();
   }
 
-  // ---------- Socket listeners ----------
+  // SOCKET listeners
   useEffect(() => {
     if (step !== "room") return;
 
@@ -303,10 +291,12 @@ export default function App() {
       setVideoReadyIds(st.videoReadyIds || []);
     };
 
-    const onPeerJoined = ({ peerId }) => {
-      if (videoEnabled && localStream) createPeer(peerId);
+    // ✅ IMPORTANT: DO NOT create peers on peer-joined
+    const onPeerJoined = () => {
+      // No video action here.
     };
 
+    // ✅ Create peer ONLY when the other user clicks Start Webcam
     const onVideoReady = ({ peerId }) => {
       if (videoEnabled && localStream) createPeer(peerId);
     };
@@ -381,22 +371,17 @@ export default function App() {
       initiator,
       trickle: true,
       stream: localStream,
-      config: {
-        iceServers: iceServers && iceServers.length ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }],
-      },
+      config: { iceServers: iceServers?.length ? iceServers : [{ urls: "stun:stun.l.google.com:19302" }] },
     });
 
     peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
 
     const onRemoteStream = (stream) => {
-      // ✅ Save it, then attach (now or later when video mounts)
       remoteStreamsRef.current[peerId] = stream;
       attachStreamWithRetry(peerId);
     };
 
     peer.on("stream", onRemoteStream);
-
-    // ✅ Safari/iOS sometimes uses track instead of stream
     peer.on("track", (track, stream) => {
       if (stream) onRemoteStream(stream);
     });
@@ -411,9 +396,8 @@ export default function App() {
 
     peersRef.current[peerId] = peer;
 
-    // Apply any buffered signals
     const pending = pendingSignalsRef.current[peerId];
-    if (pending && pending.length) {
+    if (pending?.length) {
       pending.forEach((sig) => {
         try {
           peer.signal(sig);
@@ -435,10 +419,10 @@ export default function App() {
       setLocalStream(stream);
       setVideoEnabled(true);
 
-      // tell others I started
+      // Tell others I'm ready
       socket.emit("video-ready", { roomId });
 
-      // connect to peers already ready
+      // ✅ Connect ONLY to users who are already video-ready
       const ready = new Set(videoReadyIds || []);
       (users || [])
         .filter((u) => u?.id && u.id !== mySocketId && ready.has(u.id))
@@ -528,7 +512,6 @@ export default function App() {
     setText("");
   }
 
-  // ✅ Bet pick options (buttons)
   const pickOptions = useMemo(() => {
     if (!selectedGame) return [];
     return [
@@ -550,6 +533,7 @@ export default function App() {
     if (!betTarget) return;
     if (!betTitle.trim()) return;
     if (!betPick.trim()) return;
+
     socket.emit("createBetOffer", {
       roomId,
       targetUserId: betTarget.id,
@@ -557,6 +541,7 @@ export default function App() {
       stake: Number(betStake || 0),
       pick: betPick,
     });
+
     setBetTarget(null);
   }
 
@@ -767,11 +752,17 @@ export default function App() {
     );
   }
 
-  // ROOM
   const privateRoom = isPrivateRoom(roomId);
   const liveHeaderGame = roomGameLive || selectedGame;
   const liveScoreText = liveHeaderGame ? scoreLine(liveHeaderGame) : "";
   const liveStatusText = liveHeaderGame?.status ? String(liveHeaderGame.status) : "";
+
+  const pickoptions = selectedGame
+    ? [
+        { label: selectedGame.away, value: `${selectedGame.away} win` },
+        { label: selectedGame.home, value: `${selectedGame.home} win` },
+      ]
+    : [];
 
   return (
     <div style={{ height: "100vh", display: "flex", fontFamily: "Arial, sans-serif" }}>
@@ -782,10 +773,7 @@ export default function App() {
             {selectedGame ? (
               <>
                 {" "}
-                • <b>{gameTitle(selectedGame)}</b>
-                {" "}
-                • <b>{liveScoreText || "—"}</b>
-                {" "}
+                • <b>{gameTitle(selectedGame)}</b> • <b>{liveScoreText || "—"}</b>{" "}
                 <span style={{ opacity: 0.8 }}>({liveStatusText || "status"})</span>
               </>
             ) : null}
@@ -840,7 +828,6 @@ export default function App() {
                     .map((u) => (
                       <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
                         <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
-
                         <video
                           autoPlay
                           playsInline
@@ -849,8 +836,6 @@ export default function App() {
                           ref={(el) => {
                             if (!el) return;
                             remoteVideoRefs.current[u.id] = el;
-
-                            // ✅ if stream already arrived earlier, attach now
                             attachStreamWithRetry(u.id);
                           }}
                           onClick={(e) => {
@@ -865,10 +850,6 @@ export default function App() {
               ) : (
                 <div style={{ fontSize: 12, opacity: 0.8 }}>Video is OFF. Click “Start Webcam + Mic”.</div>
               )}
-            </div>
-
-            <div style={{ marginTop: 8, fontSize: 12, opacity: 0.7 }}>
-              Tip: remote videos start muted (to avoid autoplay blocking). Click a video to unmute.
             </div>
           </div>
         ) : null}
@@ -931,7 +912,6 @@ export default function App() {
           ) : (
             <div style={{ width: 360, border: "1px dashed #aaa", borderRadius: 10, padding: 10, opacity: 0.95 }}>
               <div style={{ fontWeight: "bold" }}>Bets</div>
-
               <div style={{ marginTop: 10, maxHeight: 220, overflowY: "auto" }}>
                 {bets.length === 0 ? <div style={{ opacity: 0.7 }}>No bets yet.</div> : null}
 

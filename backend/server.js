@@ -349,7 +349,6 @@ app.get("/api/games", async (req, res) => {
 
 // -------------------- Rooms / chat / bets / WebRTC signaling --------------------
 const roomState = new Map();
-
 function getOrCreateRoom(roomId) {
   if (!roomState.has(roomId)) {
     roomState.set(roomId, {
@@ -397,11 +396,13 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("message", { user, text });
   });
 
+  // ✅ WebRTC signaling pass-through
   socket.on("signal", ({ to, from, data }) => {
     if (!to || !data) return;
     io.to(to).emit("signal", { from, data });
   });
 
+  // ✅ When someone clicks "Start Webcam", tell others to connect to them
   socket.on("video-ready", ({ roomId }) => {
     const st = roomState.get(roomId);
     if (!st) return;
@@ -432,7 +433,6 @@ io.on("connection", (socket) => {
       creatorStake: Number(stake || 0),
       targetStake: Number(stake || 0),
       creatorPick: String(pick || ""),
-      targetPick: "",
       winnerName: "",
     });
 
@@ -449,7 +449,7 @@ io.on("connection", (socket) => {
     if (socket.id !== bet.targetId) return;
 
     bet.status = "active";
-    bet.targetPick = String(targetPick || "");
+    bet.targetPick = String(targetPick || "ACCEPT");
     bet.targetStake = Number(targetStake || bet.targetStake);
 
     emitRoom(roomId);
