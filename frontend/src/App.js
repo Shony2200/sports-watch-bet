@@ -61,6 +61,13 @@ function scoreLine(g) {
   return `${g.awayScore}-${g.homeScore}`;
 }
 
+function isoDateFromStartTime(startTime) {
+  // ESPN gives ISO like 2026-01-10T...Z
+  const s = String(startTime || "");
+  if (s.length >= 10 && s[4] === "-" && s[7] === "-") return s.slice(0, 10);
+  return todayISO();
+}
+
 export default function App() {
   const [username, setUsername] = useState(localStorage.getItem("wb_username") || "");
   const [step, setStep] = useState(username ? "lobby" : "enterName"); // enterName | lobby | room
@@ -81,6 +88,11 @@ export default function App() {
 
   const [roomId, setRoomId] = useState("");
   const [selectedGame, setSelectedGame] = useState(null);
+
+  // ✅ Live score shown in the room
+  const [roomGameLive, setRoomGameLive] = useState(null);
+  const [roomGameError, setRoomGameError] = useState("");
+
   const [users, setUsers] = useState([]);
   const [videoReadyIds, setVideoReadyIds] = useState([]);
   const [bets, setBets] = useState([]);
@@ -103,7 +115,8 @@ export default function App() {
   const [localStream, setLocalStream] = useState(null);
   const [iceServers, setIceServers] = useState([]);
   const peersRef = useRef({});
-  const remoteVideoRefs = useRef({});
+  const remoteVideoRefs = useRef({});   // peerId -> HTMLVideoElement
+  const remoteStreamsRef = useRef({});  // ✅ peerId -> MediaStream (fixes "stream arrives before video exists")
   const pendingSignalsRef = useRef({}); // peerId -> [signalData]
   const [mySocketId, setMySocketId] = useState("");
 
@@ -120,7 +133,7 @@ export default function App() {
     return String(rid || "").startsWith("private:");
   }
 
-  // ✅ Deterministic initiator to avoid glare
+  // ✅ deterministic initiator (prevents double-offer glare issues)
   function shouldInitiate(peerId) {
     if (!mySocketId || !peerId) return false;
     return String(mySocketId) < String(peerId);
@@ -178,6 +191,36 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [step, sport, date, leagueCode]);
 
+  // ✅ Live score polling when in room (public or private)
+  useEffect(() => {
+    if (step !== "room" || !selectedGame?.id || !selectedGame?.sport) return;
+
+    let alive = true;
+    const poll = async () => {
+      try {
+        setRoomGameError("");
+        const d = isoDateFromStartTime(selectedGame.startTime);
+        const res = await axios.get(`${BACKEND}/api/games`, {
+          params: { sport: selectedGame.sport, date: d, leagueCode: selectedGame.leagueCode || "" },
+          timeout: 20000,
+        });
+        const list = res.data?.games || [];
+        const found = list.find((x) => String(x.id) === String(selectedGame.id));
+        if (alive) setRoomGameLive(found || null);
+      } catch (e) {
+        const msg = e?.response?.data?.details || e?.message || "Live score fetch failed";
+        if (alive) setRoomGameError(String(msg));
+      }
+    };
+
+    poll();
+    const t = setInterval(poll, 10000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [step, selectedGame?.id, selectedGame?.sport, selectedGame?.startTime, selectedGame?.leagueCode]);
+
   const regions = useMemo(() => catalog.map((r) => r.region), [catalog]);
 
   const countries = useMemo(() => {
@@ -215,6 +258,33 @@ export default function App() {
     }
   }, [sport]);
 
+  // ✅ Attach stream to video safely (works even if video mounts later)
+  function attachStreamToVideo(peerId) {
+    const el = remoteVideoRefs.current[peerId];
+    const stream = remoteStreamsRef.current[peerId];
+    if (!el || !stream) return false;
+
+    try {
+      if (el.srcObject !== stream) el.srcObject = stream;
+      const p = el.play?.();
+      if (p && typeof p.catch === "function") p.catch(() => {});
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function attachStreamWithRetry(peerId) {
+    let tries = 0;
+    const tick = () => {
+      tries += 1;
+      const ok = attachStreamToVideo(peerId);
+      if (ok) return;
+      if (tries < 20) setTimeout(tick, 250); // retry up to ~5 seconds
+    };
+    tick();
+  }
+
   // ---------- Socket listeners ----------
   useEffect(() => {
     if (step !== "room") return;
@@ -246,6 +316,7 @@ export default function App() {
       if (p) p.destroy();
       delete peersRef.current[peerId];
       delete remoteVideoRefs.current[peerId];
+      delete remoteStreamsRef.current[peerId];
       setVideoEnabled((v) => v);
     };
 
@@ -293,6 +364,7 @@ export default function App() {
     });
     peersRef.current = {};
     pendingSignalsRef.current = {};
+    remoteStreamsRef.current = {};
 
     if (localStream) localStream.getTracks().forEach((t) => t.stop());
     setLocalStream(null);
@@ -300,6 +372,7 @@ export default function App() {
 
   function createPeer(peerId) {
     if (!peerId) return null;
+    if (peerId === mySocketId) return null;
     if (peersRef.current[peerId]) return peersRef.current[peerId];
 
     const initiator = shouldInitiate(peerId);
@@ -315,34 +388,30 @@ export default function App() {
 
     peer.on("signal", (data) => socket.emit("signal", { to: peerId, from: socket.id, data }));
 
-    const attachToRemote = (stream) => {
-      setTimeout(() => {
-        const el = remoteVideoRefs.current[peerId];
-        if (!el) return;
-        el.srcObject = stream;
-
-        // force play (desktop safari/chrome sometimes blocks unless muted)
-        const p = el.play?.();
-        if (p && typeof p.catch === "function") p.catch(() => {});
-      }, 0);
+    const onRemoteStream = (stream) => {
+      // ✅ Save it, then attach (now or later when video mounts)
+      remoteStreamsRef.current[peerId] = stream;
+      attachStreamWithRetry(peerId);
     };
 
-    peer.on("stream", attachToRemote);
+    peer.on("stream", onRemoteStream);
 
-    // ✅ Safari/iOS sometimes uses track
+    // ✅ Safari/iOS sometimes uses track instead of stream
     peer.on("track", (track, stream) => {
-      if (stream) attachToRemote(stream);
+      if (stream) onRemoteStream(stream);
     });
 
     peer.on("close", () => {
       delete peersRef.current[peerId];
       delete remoteVideoRefs.current[peerId];
+      delete remoteStreamsRef.current[peerId];
     });
 
     peer.on("error", () => {});
 
     peersRef.current[peerId] = peer;
 
+    // Apply any buffered signals
     const pending = pendingSignalsRef.current[peerId];
     if (pending && pending.length) {
       pending.forEach((sig) => {
@@ -366,9 +435,10 @@ export default function App() {
       setLocalStream(stream);
       setVideoEnabled(true);
 
+      // tell others I started
       socket.emit("video-ready", { roomId });
 
-      // ✅ only connect to already video-ready peers
+      // connect to peers already ready
       const ready = new Set(videoReadyIds || []);
       (users || [])
         .filter((u) => u?.id && u.id !== mySocketId && ready.has(u.id))
@@ -398,6 +468,7 @@ export default function App() {
     const rid = `public:${sport}:${game.id}`;
     setRoomId(rid);
     setSelectedGame(game);
+    setRoomGameLive(null);
     setUsers([]);
     setBets([]);
     setMessages([]);
@@ -415,6 +486,7 @@ export default function App() {
     const rid = `private:${code}`;
     setRoomId(rid);
     setSelectedGame(game);
+    setRoomGameLive(null);
     setUsers([]);
     setBets([]);
     setMessages([]);
@@ -697,6 +769,9 @@ export default function App() {
 
   // ROOM
   const privateRoom = isPrivateRoom(roomId);
+  const liveHeaderGame = roomGameLive || selectedGame;
+  const liveScoreText = liveHeaderGame ? scoreLine(liveHeaderGame) : "";
+  const liveStatusText = liveHeaderGame?.status ? String(liveHeaderGame.status) : "";
 
   return (
     <div style={{ height: "100vh", display: "flex", fontFamily: "Arial, sans-serif" }}>
@@ -708,9 +783,15 @@ export default function App() {
               <>
                 {" "}
                 • <b>{gameTitle(selectedGame)}</b>
+                {" "}
+                • <b>{liveScoreText || "—"}</b>
+                {" "}
+                <span style={{ opacity: 0.8 }}>({liveStatusText || "status"})</span>
               </>
             ) : null}
+            {roomGameError ? <span style={{ marginLeft: 10, color: "#b00" }}>Live score error: {roomGameError}</span> : null}
           </div>
+
           <button
             onClick={() => {
               stopVideo();
@@ -746,30 +827,31 @@ export default function App() {
                       muted
                       style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
                       ref={(el) => {
-                        if (el && localStream) {
-                          el.srcObject = localStream;
-                          const p = el.play?.();
-                          if (p && typeof p.catch === "function") p.catch(() => {});
-                        }
+                        if (!el || !localStream) return;
+                        el.srcObject = localStream;
+                        const p = el.play?.();
+                        if (p && typeof p.catch === "function") p.catch(() => {});
                       }}
                     />
                   </div>
 
-                  {/* ✅ Remote tiles: show anyone whose socket id is not mine */}
                   {users
                     .filter((u) => u.id && u.id !== mySocketId)
                     .map((u) => (
                       <div key={u.id} style={{ border: "1px solid #aaa", padding: 6, borderRadius: 8 }}>
                         <div style={{ fontSize: 12, opacity: 0.8 }}>{u.username}</div>
 
-                        {/* ✅ MUTED = autoplay allowed. Click video to unmute. */}
                         <video
                           autoPlay
                           playsInline
                           muted
                           style={{ width: 220, height: 140, background: "#000", borderRadius: 8 }}
                           ref={(el) => {
-                            if (el) remoteVideoRefs.current[u.id] = el;
+                            if (!el) return;
+                            remoteVideoRefs.current[u.id] = el;
+
+                            // ✅ if stream already arrived earlier, attach now
+                            attachStreamWithRetry(u.id);
                           }}
                           onClick={(e) => {
                             e.currentTarget.muted = false;
@@ -802,7 +884,7 @@ export default function App() {
                     <div style={{ fontSize: 12, opacity: 0.7 }}>Credits: {u.credits}</div>
                   </div>
                   {u.id !== mySocketId ? (
-                    <button onClick={() => { setBetTarget(u); setBetTitle(`${selectedGame ? gameTitle(selectedGame) : "Match"} — my pick:`); setBetPick(""); setBetStake(100); setAcceptPick(""); setAcceptStake(100); }} style={{ height: 34 }}>
+                    <button onClick={() => openBetToUser(u)} style={{ height: 34 }}>
                       Offer Bet
                     </button>
                   ) : null}
@@ -834,7 +916,6 @@ export default function App() {
                   </button>
                 ))}
               </div>
-              {betPick ? <div style={{ marginTop: 8, fontSize: 12 }}>Selected: <b>{betPick}</b></div> : null}
 
               <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                 <input type="number" value={betStake} onChange={(e) => setBetStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
@@ -893,7 +974,6 @@ export default function App() {
                             </button>
                           ))}
                         </div>
-                        {acceptPick ? <div style={{ marginTop: 8, fontSize: 12 }}>Selected: <b>{acceptPick}</b></div> : null}
 
                         <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
                           <input type="number" value={acceptStake} onChange={(e) => setAcceptStake(Number(e.target.value))} style={{ width: 140, padding: 10 }} />
